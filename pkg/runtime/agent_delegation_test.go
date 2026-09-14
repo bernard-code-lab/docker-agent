@@ -1868,8 +1868,9 @@ func newDelegationRuntime(t *testing.T, agents ...*agent.Agent) *LocalRuntime {
 //
 // The nested case is the regression guard for #4156's first fix: claiming the
 // switch runtime-globally for the outer delegation's whole lifetime also pinned
-// the sequential child underneath it, which silently suppressed that child's
-// force_handoff (loop.go only honours it for unpinned sessions).
+// the sequential child underneath it, changing where that child's switch events
+// and force_handoff routing were observed. Pinning is a routing decision only —
+// every case below still reaches its force_handoff target.
 func TestTransferTask_PinningByBatchShape(t *testing.T) {
 	t.Parallel()
 
@@ -1943,7 +1944,7 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 			wantHandoffCalls: 1,
 		},
 		{
-			name: "parallel sibling batch pins every child, suppressing force_handoff",
+			name: "parallel sibling batch pins every child, force_handoff still reached",
 			setup: func(t *testing.T) (*LocalRuntime, *handoffRecordingProvider) {
 				t.Helper()
 				finisher, probe := handoffProbe("finisher")
@@ -1958,7 +1959,9 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 				root := delegatingAgent("root", workers, "drafter", "reviewer", "tester")
 				return newDelegationRuntime(t, append([]*agent.Agent{root, finisher}, workers...)...), probe
 			},
-			wantHandoffCalls: 0,
+			// One per pinned child: pinning protects the shared current agent,
+			// it must not cost the children their deterministic routing.
+			wantHandoffCalls: 3,
 		},
 	}
 
@@ -2013,4 +2016,38 @@ func TestHandoff_UsesBatchCallerSnapshotNotSharedCurrentAgent(t *testing.T) {
 	require.False(t, result.IsError,
 		"the caller must come from the batch snapshot (root), not the swapped current agent: %s", result.Output)
 	assert.Equal(t, "specialist", rt.CurrentAgentName(t.Context()))
+}
+
+// TestHandoff_FromPinnedSession_RepinsWithoutTouchingSharedCurrentAgent extends
+// #3886 to handoff. Resolving the caller from the session (what the batch
+// snapshot falls back to) makes a handoff issued from a pinned background
+// session pass validation, so it now reaches the agent switch: that switch must
+// re-pin the session itself, never the shared current agent, which belongs to
+// the concurrent foreground loop.
+func TestHandoff_FromPinnedSession_RepinsWithoutTouchingSharedCurrentAgent(t *testing.T) {
+	t.Parallel()
+
+	idle := func() *mockProvider { return &mockProvider{id: "test/mock-model", stream: &mockStream{}} }
+
+	specialist := agent.New("specialist", "Specialist agent", agent.WithModel(idle()))
+	background := agent.New("background", "Background agent", agent.WithModel(idle()),
+		agent.WithHandoffs(specialist))
+	foreground := agent.New("foreground", "Foreground agent", agent.WithModel(idle()))
+
+	rt := newDelegationRuntime(t, foreground, background, specialist)
+	rt.setCurrentAgent("foreground")
+
+	sess := session.New(session.WithUserMessage("Test"),
+		session.WithToolsApproved(true), session.WithAgentName("background"))
+	result, err := rt.handleHandoff(t.Context(), sess, handoffToolCall("specialist"),
+		NewChannelSink(make(chan Event, 128)), tools.NopRuntime{})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.IsError,
+		"the pinned agent is the caller, and specialist is in its handoffs list: %s", result.Output)
+
+	assert.Equal(t, "specialist", sess.AgentName,
+		"the pinned session must move to the handoff target")
+	assert.Equal(t, "foreground", rt.CurrentAgentName(t.Context()),
+		"the shared current agent belongs to the foreground loop and must not be mutated (#3886)")
 }

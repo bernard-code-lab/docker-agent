@@ -215,6 +215,10 @@ type delegationRequest struct {
 	// foreground loop and must not be mutated from a background task (#3886).
 	// When sibling delegations share this call's tool-call batch, they all run
 	// in parallel and none may own the shared current agent (#4156).
+	//
+	// The downgrade only changes where the child's agent is resolved from, not
+	// what it may do: a pinned child still routes its own force_handoff, moving
+	// its pin instead of the shared current agent.
 	SwitchCurrentAgent bool
 }
 
@@ -811,7 +815,7 @@ func (r *LocalRuntime) handleHandoff(ctx context.Context, sess *session.Session,
 	defer span.End()
 
 	r.executeOnAgentSwitchHooks(ctx, currentAgent, sess.ID, ca, next.Name(), agentSwitchKindHandoff)
-	r.setCurrentAgent(next.Name())
+	r.switchSessionAgent(sess, next.Name())
 	handoffMessage := "The agent " + ca + " handed off the conversation to you. " +
 		"Your available handoff agents and tools are specified in the system messages that follow. " +
 		"Only use those capabilities - do not attempt to use tools or hand off to agents that you see " +
@@ -821,6 +825,20 @@ func (r *LocalRuntime) handleHandoff(ctx context.Context, sess *session.Session,
 		"Complete your part of the task and hand off to the next appropriate agent in your workflow " +
 		"(if any are available to you), or respond directly to the user if you are the final agent."
 	return tools.ResultSuccess(handoffMessage), nil
+}
+
+// switchSessionAgent moves sess to the agent named to. A pinned session (a
+// background agent's session, or a child pinned by a parallel delegation
+// batch) re-pins itself: the runtime's shared current agent belongs to the
+// concurrent foreground loop and must not be mutated from it (#3886). An
+// unpinned session has no pin to move, so the shared current agent is the
+// session's agent and is swapped instead.
+func (r *LocalRuntime) switchSessionAgent(sess *session.Session, to string) {
+	if sess.AgentName != "" {
+		sess.AgentName = to
+		return
+	}
+	r.setCurrentAgent(to)
 }
 
 // applyForceHandoff routes the conversation to the agent's configured
@@ -835,7 +853,7 @@ func (r *LocalRuntime) applyForceHandoff(ctx context.Context, sess *session.Sess
 	slog.InfoContext(ctx, "Forced handoff", "from_agent", from.Name(), "to_agent", to.Name(), "session_id", sess.ID)
 
 	r.executeOnAgentSwitchHooks(ctx, from, sess.ID, from.Name(), to.Name(), agentSwitchKindForceHandoff)
-	r.setCurrentAgent(to.Name())
+	r.switchSessionAgent(sess, to.Name())
 
 	sess.AddMessage(session.ImplicitUserMessage(
 		"The agent " + from.Name() + " finished its response and the conversation was automatically " +
