@@ -19,6 +19,7 @@ import (
 	"github.com/docker/docker-agent/pkg/tools"
 	agenttool "github.com/docker/docker-agent/pkg/tools/builtin/agent"
 	"github.com/docker/docker-agent/pkg/tools/builtin/handoff"
+	"github.com/docker/docker-agent/pkg/tools/builtin/transfertask"
 )
 
 // agentNames returns the names of the given agents.
@@ -762,8 +763,11 @@ func (r *LocalRuntime) handleTaskTransfer(ctx context.Context, sess *session.Ses
 			NonInteractive:    sess.NonInteractive,
 			DelegationLineage: childLineage,
 		},
-		CallerAgent:        a,
-		ConcurrentBatch:    concurrentSiblings(rt) > 1,
+		CallerAgent: a,
+		// handoff moves the session's agent too, so a lone transfer_task
+		// beside one is not solo: claiming the switch would restore the
+		// caller over the handoff on the way out (#4156).
+		ConcurrentBatch:    concurrentCalls(rt, transfertask.ToolNameTransferTask, handoff.ToolNameHandoff) > 1,
 		SwitchCurrentAgent: true,
 	})
 }

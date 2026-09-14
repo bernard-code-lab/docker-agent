@@ -1842,10 +1842,14 @@ func delegatingAgent(name string, subAgents []*agent.Agent, targets ...string) *
 // handoffProbe returns an agent whose model invocations are counted, standing
 // in for a force_handoff target that must (or must not) be reached.
 func handoffProbe(name string) (*agent.Agent, *handoffRecordingProvider) {
-	prov := &handoffRecordingProvider{mockProvider: mockProvider{
-		id:     "test/mock-model",
-		stream: newStreamBuilder().AddContent(name+" done").AddStopWithUsage(10, 5).Build(),
-	}}
+	prov := &handoffRecordingProvider{
+		mockProvider: mockProvider{id: "test/mock-model"},
+		// Fresh per invocation: a batch of parallel delegations all routing here
+		// reaches the probe concurrently.
+		newStream: func() chat.MessageStream {
+			return newStreamBuilder().AddContent(name+" done").AddStopWithUsage(10, 5).Build()
+		},
+	}
 	return agent.New(name, name+" agent", agent.WithModel(prov)), prov
 }
 
@@ -1885,8 +1889,10 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 				t.Helper()
 				finisher, probe := handoffProbe("finisher")
 				worker := agent.New("worker", "worker agent",
-					agent.WithModel(&mockProvider{id: "test/mock-model",
-						stream: newStreamBuilder().AddContent("worker done").AddStopWithUsage(10, 5).Build()}),
+					agent.WithModel(&mockProvider{
+						id:     "test/mock-model",
+						stream: newStreamBuilder().AddContent("worker done").AddStopWithUsage(10, 5).Build(),
+					}),
 					agent.WithForceHandoff(finisher),
 				)
 				root := delegatingAgent("root", []*agent.Agent{worker}, "worker")
@@ -1900,8 +1906,10 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 				t.Helper()
 				finisher, probe := handoffProbe("finisher")
 				worker := agent.New("worker", "worker agent",
-					agent.WithModel(&mockProvider{id: "test/mock-model",
-						stream: newStreamBuilder().AddContent("worker done").AddStopWithUsage(10, 5).Build()}),
+					agent.WithModel(&mockProvider{
+						id:     "test/mock-model",
+						stream: newStreamBuilder().AddContent("worker done").AddStopWithUsage(10, 5).Build(),
+					}),
 					agent.WithForceHandoff(finisher),
 				)
 				lead := delegatingAgent("lead", []*agent.Agent{worker}, "worker")
@@ -1916,8 +1924,10 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 				t.Helper()
 				finisher, probe := handoffProbe("finisher")
 				worker := agent.New("worker", "worker agent",
-					agent.WithModel(&mockProvider{id: "test/mock-model",
-						stream: newStreamBuilder().AddContent("worker done").AddStopWithUsage(10, 5).Build()}),
+					agent.WithModel(&mockProvider{
+						id:     "test/mock-model",
+						stream: newStreamBuilder().AddContent("worker done").AddStopWithUsage(10, 5).Build(),
+					}),
 					agent.WithForceHandoff(finisher),
 				)
 
@@ -1951,8 +1961,10 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 				workers := make([]*agent.Agent, 0, 3)
 				for _, name := range []string{"drafter", "reviewer", "tester"} {
 					workers = append(workers, agent.New(name, name+" agent",
-						agent.WithModel(&mockProvider{id: "test/mock-model",
-							stream: newStreamBuilder().AddContent(name+" done").AddStopWithUsage(10, 5).Build()}),
+						agent.WithModel(&mockProvider{
+							id:     "test/mock-model",
+							stream: newStreamBuilder().AddContent(name+" done").AddStopWithUsage(10, 5).Build(),
+						}),
 						agent.WithForceHandoff(finisher),
 					))
 				}
@@ -2050,4 +2062,55 @@ func TestHandoff_FromPinnedSession_RepinsWithoutTouchingSharedCurrentAgent(t *te
 		"the pinned session must move to the handoff target")
 	assert.Equal(t, "foreground", rt.CurrentAgentName(t.Context()),
 		"the shared current agent belongs to the foreground loop and must not be mutated (#3886)")
+}
+
+// TestTransferTask_MixedBatchWithHandoffDoesNotClobberTheSwitch closes the last
+// gap of #4156: the batch tally is per delegating tool, so a lone transfer_task
+// standing beside a handoff still counted itself solo, claimed the shared
+// current agent, and restored it to the caller on the way out — silently undoing
+// the handoff that ran next to it. Whether the handoff survived depended on
+// which goroutine finished last.
+//
+// transfer_task must weigh every call in the batch that can move the session's
+// agent, not just its own namesake: with a handoff beside it, the delegation is
+// pinned and the handoff's switch stands.
+func TestTransferTask_MixedBatchWithHandoffDoesNotClobberTheSwitch(t *testing.T) {
+	t.Parallel()
+
+	worker := agent.New("worker", "Worker agent", agent.WithModel(&mockProvider{
+		id:     "test/mock-model",
+		stream: newStreamBuilder().AddContent("worker done").AddStopWithUsage(10, 5).Build(),
+	}))
+	specialist := agent.New("specialist", "Specialist agent", agent.WithModel(&mockProvider{
+		id:     "test/mock-model",
+		stream: newStreamBuilder().AddContent("specialist done").AddStopWithUsage(10, 5).Build(),
+	}))
+
+	// One assistant response carrying both delegating calls.
+	batch := newStreamBuilder().
+		AddToolCallName(transferCallID(0), transfertask.ToolNameTransferTask).
+		AddToolCallArguments(transferCallID(0), `{"agent":"worker","task":"chunk","expected_output":"result"}`).
+		AddToolCallName("call_handoff", handoff.ToolNameHandoff).
+		AddToolCallArguments("call_handoff", `{"agent":"specialist"}`)
+
+	root := agent.New("root", "Root agent",
+		agent.WithModel(&queueProvider{id: "test/mock-model", streams: []chat.MessageStream{
+			batch.AddToolCallStopWithUsage(10, 5).Build(),
+		}}),
+		agent.WithSubAgents(worker),
+		agent.WithHandoffs(specialist),
+		agent.WithToolSets(transfertask.New(), handoff.New()),
+	)
+
+	rt := newDelegationRuntime(t, root, worker, specialist)
+
+	sess := session.New(session.WithUserMessage("split and route"), session.WithToolsApproved(true))
+	_, err := rt.Run(t.Context(), sess)
+	require.NoError(t, err)
+
+	assert.Equal(t, "worker done", toolResultContent(t, sess, transferCallID(0)),
+		"the delegation must still run as its own target")
+	assert.Equal(t, "specialist", rt.CurrentAgent().Name(),
+		"the sibling handoff owns the switch; the delegation must not restore the caller over it")
+	assert.Equal(t, "specialist done", sess.GetLastAssistantMessageContent())
 }

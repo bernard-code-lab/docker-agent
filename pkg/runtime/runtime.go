@@ -1349,15 +1349,17 @@ func (r *LocalRuntime) callerAgent(rt tools.Runtime, sess *session.Session) *age
 // before dispatching the batch in parallel, so every sibling reads the same
 // number.
 type toolBatchProvider interface {
-	ConcurrentSiblings() int
+	ConcurrentCalls(names ...string) int
 }
 
-// concurrentSiblings reports how many calls to the in-flight tool the current
-// batch carries, including this one. Hosts without a dispatcher batch
+// concurrentCalls reports how many calls to the named tools the in-flight batch
+// carries, this one included. Callers name every tool that contends for what
+// they are about to claim — a lone transfer_task beside a handoff is not solo,
+// because both move the session's agent. Hosts without a dispatcher batch
 // (NopRuntime in tests, standalone skill invocations) report a solo call.
-func concurrentSiblings(rt tools.Runtime) int {
+func concurrentCalls(rt tools.Runtime, names ...string) int {
 	if p, ok := rt.(toolBatchProvider); ok {
-		if n := p.ConcurrentSiblings(); n > 0 {
+		if n := p.ConcurrentCalls(names...); n > 0 {
 			return n
 		}
 	}

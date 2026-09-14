@@ -22,6 +22,12 @@ import (
 type handoffRecordingProvider struct {
 	mockProvider
 
+	// newStream, when set, builds a fresh stream per invocation. A probe can be
+	// reached more than once at a time — parallel delegation children each
+	// routing to the same force_handoff target — and mockProvider hands out one
+	// single-use mockStream whose cursor is not safe for concurrent Recv.
+	newStream func() chat.MessageStream
+
 	mu       sync.Mutex
 	calls    int
 	lastMsgs []chat.Message
@@ -32,6 +38,9 @@ func (p *handoffRecordingProvider) CreateChatCompletionStream(ctx context.Contex
 	p.calls++
 	p.lastMsgs = append([]chat.Message(nil), msgs...)
 	p.mu.Unlock()
+	if p.newStream != nil {
+		return p.newStream(), nil
+	}
 	return p.mockProvider.CreateChatCompletionStream(ctx, msgs, t)
 }
 

@@ -256,7 +256,9 @@ func (d *Dispatcher) Process(ctx context.Context, sess *session.Session, calls [
 	// Tally the batch per tool so a handler can tell a solo invocation from
 	// one whose siblings run beside it. transfer_task needs this to decide
 	// deterministically, before any of them starts, whether a delegation may
-	// own the runtime's shared current agent (#4156).
+	// own the runtime's shared current agent (#4156). The whole tally is
+	// handed to every call: a handler weighs the tools it cares about, which
+	// are not only its own namesake.
 	batchByTool := make(map[string]int, len(calls))
 	for _, tc := range calls {
 		batchByTool[tc.Function.Name]++
@@ -267,7 +269,7 @@ func (d *Dispatcher) Process(ctx context.Context, sess *session.Session, calls [
 
 	var stopOnce sync.Once
 	outcomes := concurrent.MapSlice(calls, func(tc tools.ToolCall) CallOutcome {
-		c := d.newCall(sess, em, a, tc, toolByName, batchByTool[tc.Function.Name])
+		c := d.newCall(sess, em, a, tc, toolByName, batchByTool)
 		outcome := c.run(batchCtx)
 		switch {
 		case outcome.Canceled:
@@ -290,7 +292,7 @@ func (d *Dispatcher) Process(ctx context.Context, sess *session.Session, calls [
 // referenced tool in the agent's toolset. When the tool isn't found, the
 // call is marked unavailable and tool.Name is set to the requested name
 // so error events still carry a meaningful label.
-func (d *Dispatcher) newCall(sess *session.Session, em Emitter, a *agent.Agent, tc tools.ToolCall, toolByName map[string]tools.Tool, siblings int) *call {
+func (d *Dispatcher) newCall(sess *session.Session, em Emitter, a *agent.Agent, tc tools.ToolCall, toolByName map[string]tools.Tool, batchByTool map[string]int) *call {
 	tool, available := toolByName[tc.Function.Name]
 	if !available {
 		tool = tools.Tool{Name: tc.Function.Name}
@@ -303,7 +305,7 @@ func (d *Dispatcher) newCall(sess *session.Session, em Emitter, a *agent.Agent, 
 		tc:        tc,
 		tool:      tool,
 		available: available,
-		siblings:  siblings,
+		batch:     batchByTool,
 	}
 }
 
@@ -324,7 +326,7 @@ type call struct {
 	tc        tools.ToolCall // mutable: pre_tool_use hooks may rewrite arguments
 	tool      tools.Tool     // tool.Name is always set; other fields zero when !available
 	available bool           // false when the tool wasn't in the agent's toolset
-	siblings  int            // calls to this same tool in the in-flight batch, including this one
+	batch     map[string]int // per-tool call counts of the in-flight batch; read-only after Process builds it
 	outOfBand bool           // true for nested actions not recorded in the model conversation
 	started   bool           // whether an out-of-band ToolCall event was emitted
 	prompted  bool           // whether an out-of-band confirmation was emitted
@@ -1074,11 +1076,19 @@ func (r callRuntime) EmitOutput(ctx context.Context, output string) {
 // may already have swapped the runtime's shared current agent (#4156).
 func (r callRuntime) CallerAgent() *agent.Agent { return r.c.a }
 
-// ConcurrentSiblings reports how many calls to this tool the in-flight batch
-// carries, including this one. Counted by [Dispatcher.Process] before the
+// ConcurrentCalls reports how many calls to the named tools the in-flight batch
+// carries, this one included. Counted by [Dispatcher.Process] before the
 // parallel fan-out, so every sibling reads the same number and handlers can
-// branch on it deterministically rather than racing each other (#4156).
-func (r callRuntime) ConcurrentSiblings() int { return r.c.siblings }
+// branch on it deterministically rather than racing each other (#4156). A
+// handler passes every tool that contends for what it is about to claim, not
+// only its own name.
+func (r callRuntime) ConcurrentCalls(names ...string) int {
+	total := 0
+	for _, name := range names {
+		total += r.c.batch[name]
+	}
+	return total
+}
 
 func (r callRuntime) Recall(ctx context.Context, message string) error {
 	if r.c.d.Recall == nil {
