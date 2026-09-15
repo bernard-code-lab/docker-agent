@@ -67,6 +67,8 @@ func Load(ctx context.Context, source Source, opts ...LoadOption) (*latest.Confi
 		msg := yaml.FormatError(err, true, true)
 		if hint := newerVersionHint(data, raw.Version, err); hint != "" {
 			msg += "\n" + hint
+		} else if hint := removedFieldHint(raw.Version, err); hint != "" {
+			msg += "\n" + hint
 		}
 		return nil, fmt.Errorf("parsing config file\n%s", msg)
 	}
@@ -161,7 +163,7 @@ func readInstructionFiles(parentDir string, paths []string) (string, error) {
 //
 // This allows exiting early with a proper error message instead of failing later when trying to use a model or tool.
 func CheckRequiredEnvVars(ctx context.Context, cfg *latest.Config, modelsGateway string, env environment.Provider) error {
-	if modelsGateway != "" && environment.IsTrustedDockerURL(modelsGateway) {
+	if modelsGateway != "" && environment.IsDockerDomainURL(modelsGateway) {
 		if jwt, _ := env.Get(ctx, environment.DockerDesktopTokenEnv); jwt == "" {
 			return errors.New("sorry, you first need to sign in Docker Desktop to use the Docker AI Gateway")
 		}
@@ -193,16 +195,15 @@ func parseCurrentVersion(data []byte, version string) (any, error) {
 	return parser(data)
 }
 
-// newerVersionHint returns a user-facing hint when a strict-parse failure is
-// caused by a key that a newer schema version accepts. It tries the parsers
-// for every version above the declared one, in order, and points the user at
-// the smallest version that parses the config successfully. Best-effort: a
-// newer version may accept the config for unrelated reasons (laxer schema),
-// so the original unknown-field error is always shown before the hint.
 // newerVersionHint returns a hint when a parse error is caused by a key or a
 // value shape that a newer config version accepts (an unknown field, or a type
 // mismatch such as a list where an older schema only takes a string), so the
-// user is pointed at the `version` bump instead of a generic YAML error.
+// user is pointed at the `version` bump instead of a generic YAML error. It
+// tries the parsers for every version above the declared one, in order, and
+// points the user at the smallest version that parses the config successfully.
+// Best-effort: a newer version may accept the config for unrelated reasons
+// (laxer schema), so the original unknown-field error is always shown before
+// the hint.
 func newerVersionHint(data []byte, version string, parseErr error) string {
 	var unknownField *yaml.UnknownFieldError
 	var typeErr *yaml.TypeError
@@ -259,14 +260,6 @@ func validateConfig(cfg *latest.Config) error {
 
 	if cfg.Models == nil {
 		cfg.Models = map[string]latest.ModelConfig{}
-	}
-
-	for name := range cfg.Models {
-		if cfg.Models[name].ParallelToolCalls == nil {
-			m := cfg.Models[name]
-			m.ParallelToolCalls = new(true)
-			cfg.Models[name] = m
-		}
 	}
 
 	if err := ensureModelsExist(cfg); err != nil {

@@ -3,13 +3,16 @@ package root
 import (
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/docker/docker-agent/pkg/cli"
 	"github.com/docker/docker-agent/pkg/content"
+	"github.com/docker/docker-agent/pkg/protect"
 	"github.com/docker/docker-agent/pkg/remote"
 	"github.com/docker/docker-agent/pkg/telemetry"
 )
@@ -71,13 +74,17 @@ func (f *pullFlags) runPullCommand(cmd *cobra.Command, args []string) (commandEr
 	if err != nil {
 		return fmt.Errorf("failed to open content store: %w", err)
 	}
-	yamlFile, err := store.GetArtifact(registryRef)
+	storeKey, err := remote.FullyQualifiedReference(registryRef)
+	if err != nil {
+		return fmt.Errorf("failed to normalize registry reference: %w", err)
+	}
+	yamlFile, err := store.GetArtifact(storeKey)
 	if err != nil {
 		return fmt.Errorf("failed to get agent yaml: %w", err)
 	}
 
 	if key != nil {
-		metadata, err := store.GetArtifactMetadata(registryRef)
+		metadata, err := store.GetArtifactMetadata(storeKey)
 		if err != nil {
 			return fmt.Errorf("failed to get artifact metadata: %w", err)
 		}
@@ -85,7 +92,14 @@ func (f *pullFlags) runPullCommand(cmd *cobra.Command, args []string) (commandEr
 		if err != nil {
 			return fmt.Errorf("verifying %s: %w", registryRef, err)
 		}
-		out.Printf("Verified %s\n", verified)
+		// The signature proves who published the YAML, not where it was read
+		// from: check the attested subject against the reference we asked for,
+		// so a signed artifact copied elsewhere is rejected.
+		if err := verified.CheckSubject(registryRef); err != nil {
+			return fmt.Errorf("verifying %s: %w", registryRef, err)
+		}
+		out.Printf("Verified %s\n", verified.SignatureAlgorithmSummary())
+		printAttestation(out, verified.Statement)
 	}
 
 	agentName := strings.ReplaceAll(registryRef, "/", "_")
@@ -98,4 +112,25 @@ func (f *pullFlags) runPullCommand(cmd *cobra.Command, args []string) (commandEr
 	out.Printf("Agent saved to %s\n", fileName)
 
 	return nil
+}
+
+// printAttestation reports the authenticated metadata of a verified artifact.
+// A predicate this version does not know is reported as such rather than
+// hidden: the signature is still valid, only the metadata is opaque.
+func printAttestation(out *cli.Printer, stmt protect.Statement) {
+	if stmt.SubjectName() == "" {
+		return
+	}
+	out.Printf("  image:   %s\n", stmt.SubjectName())
+	out.Printf("  digest:  %s\n", stmt.Digest())
+	if !stmt.PredicateUnderstood {
+		out.Printf("  note:    predicate %s not understood by this version\n", stmt.PredicateType)
+		return
+	}
+	if created := stmt.Predicate.Created; created != "" {
+		out.Printf("  created: %s\n", created)
+	}
+	for _, field := range slices.Sorted(maps.Keys(stmt.Predicate.Unknown)) {
+		out.Printf("  %s: %s\n", field, stmt.Predicate.Unknown[field])
+	}
 }

@@ -539,17 +539,41 @@ func isOSeries(m string) bool {
 type ModelCapabilities struct {
 	supportsImage bool
 	supportsPDF   bool
+	supportsAudio bool
+	supportsVideo bool
+}
+
+// SupportsImage reports whether the model accepts image attachments.
+func (mc ModelCapabilities) SupportsImage() bool {
+	return mc.supportsImage
+}
+
+// SupportsPDF reports whether the model accepts application/pdf attachments.
+func (mc ModelCapabilities) SupportsPDF() bool {
+	return mc.supportsPDF
+}
+
+// SupportsAudio reports whether the model accepts audio attachments.
+func (mc ModelCapabilities) SupportsAudio() bool {
+	return mc.supportsAudio
+}
+
+// SupportsVideo reports whether the model accepts video attachments.
+func (mc ModelCapabilities) SupportsVideo() bool {
+	return mc.supportsVideo
 }
 
 // Supports reports whether the model can accept an attachment with the given
 // MIME type.
 //
-// Only three content families are recognised:
+// Only five content families are recognised:
 //   - image/* → requires the models.dev "image" input modality
 //   - application/pdf → requires the models.dev "pdf" input modality
+//   - audio/* → requires the models.dev "audio" input modality
+//   - video/* → requires the models.dev "video" input modality
 //   - text/* → always accepted (TXT envelope is universally safe)
 //
-// Everything else (audio, video, Office binaries, …) returns false.
+// Everything else (Office binaries, …) returns false.
 func (mc ModelCapabilities) Supports(mimeType string) bool {
 	mt := strings.ToLower(mimeType)
 	switch {
@@ -557,6 +581,10 @@ func (mc ModelCapabilities) Supports(mimeType string) bool {
 		return mc.supportsImage
 	case mt == "application/pdf":
 		return mc.supportsPDF
+	case strings.HasPrefix(mt, "audio/"):
+		return mc.supportsAudio
+	case strings.HasPrefix(mt, "video/"):
+		return mc.supportsVideo
 	case strings.HasPrefix(mt, "text/"):
 		return true
 	default:
@@ -612,6 +640,8 @@ func ContextLimit(ctx context.Context, store *modelsdev.Store, id modelsdev.ID, 
 type CapsOverride struct {
 	Image bool
 	PDF   bool
+	Audio bool
+	Video bool
 }
 
 // ResolveCaps returns the model's attachment capabilities, preferring an
@@ -624,7 +654,7 @@ type CapsOverride struct {
 // versions); see [github.com/docker/docker-agent/pkg/config/latest.CapabilitiesConfig].
 func ResolveCaps(ctx context.Context, store *modelsdev.Store, id modelsdev.ID, override *CapsOverride) ModelCapabilities {
 	if override != nil {
-		return CapsWith(override.Image, override.PDF)
+		return CapsWith(override.Image, override.PDF, override.Audio, override.Video)
 	}
 	return LoadCaps(ctx, store, id)
 }
@@ -680,24 +710,130 @@ func LoadCaps(ctx context.Context, store *modelsdev.Store, id modelsdev.ID) Mode
 		return ModelCapabilities{}
 	}
 
+	return capsFromModalities(model.Modalities.Input)
+}
+
+// ToolCallSupport is the models.dev catalogue's tri-state tool-call capability.
+type ToolCallSupport uint8
+
+const (
+	ToolCallSupportUnknown ToolCallSupport = iota
+	ToolCallUnsupported
+	ToolCallSupported
+)
+
+// ResolveToolCallSupport reports whether models.dev says a model supports tool
+// calls. Missing catalogue data remains unknown rather than being treated as a
+// negative capability claim.
+func ResolveToolCallSupport(ctx context.Context, store *modelsdev.Store, id modelsdev.ID) ToolCallSupport {
+	if store == nil {
+		return ToolCallSupportUnknown
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, loadCapsTimeout)
+	defer cancel()
+
+	model, err := store.GetModel(ctx, id)
+	if err != nil {
+		if ctx.Err() != nil {
+			slog.WarnContext(ctx, "modelinfo: models.dev tool-call lookup timed out, leaving support unknown",
+				"model", id.String(), "timeout", loadCapsTimeout)
+		} else {
+			warnCapsLookupMiss(ctx, id, err)
+		}
+		return ToolCallSupportUnknown
+	}
+	if model.ToolCall {
+		return ToolCallSupported
+	}
+	return ToolCallUnsupported
+}
+
+// ResolveOutputImage applies an explicit image-output override when present;
+// otherwise it derives support from the models.dev output modalities. Missing
+// catalogue data conservatively disables image output.
+func ResolveOutputImage(ctx context.Context, store *modelsdev.Store, id modelsdev.ID, override *bool) bool {
+	if override != nil {
+		return *override
+	}
+	if store == nil {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, loadCapsTimeout)
+	defer cancel()
+
+	model, err := store.GetModel(ctx, id)
+	if err != nil {
+		if ctx.Err() != nil {
+			slog.WarnContext(ctx, "modelinfo: models.dev output lookup timed out, disabling image output",
+				"model", id.String(), "timeout", loadCapsTimeout)
+		} else {
+			warnCapsLookupMiss(ctx, id, err)
+		}
+		return false
+	}
+	return hasOutputModality(model.Modalities.Output, "image")
+}
+
+func hasOutputModality(modalities []string, expected string) bool {
+	for _, modality := range modalities {
+		if strings.EqualFold(modality, expected) {
+			return true
+		}
+	}
+	return false
+}
+
+// booleans it grants. Unknown modality names are ignored.
+func capsFromModalities(input []string) ModelCapabilities {
 	var mc ModelCapabilities
-	for _, input := range model.Modalities.Input {
-		switch strings.ToLower(input) {
+	for _, modality := range input {
+		switch strings.ToLower(modality) {
 		case "image":
 			mc.supportsImage = true
 		case "pdf":
 			mc.supportsPDF = true
+		case "audio":
+			mc.supportsAudio = true
+		case "video":
+			mc.supportsVideo = true
 		}
 	}
 	return mc
 }
 
+// ResolveCapsFromModel applies the same precedence contract as [ResolveCaps]
+// — an explicit override wins, otherwise capabilities derive from the
+// models.dev record — for callers that fetch models through their own store
+// abstraction (e.g. the runtime's ModelStore interface) instead of a concrete
+// [*modelsdev.Store]. A nil model yields the same conservative text-only
+// default as a store miss in [LoadCaps].
+func ResolveCapsFromModel(model *modelsdev.Model, override *CapsOverride) ModelCapabilities {
+	if override != nil {
+		return CapsWith(override.Image, override.PDF, override.Audio, override.Video)
+	}
+	if model == nil {
+		return ModelCapabilities{}
+	}
+	return capsFromModalities(model.Modalities.Input)
+}
+
 // CapsWith constructs a ModelCapabilities value directly from booleans. This is
 // intended for use in tests and provider implementations that need to create a
 // capabilities value without hitting the network.
-func CapsWith(supportsImage, supportsPDF bool) ModelCapabilities {
+func CapsWith(supportsImage, supportsPDF bool, additional ...bool) ModelCapabilities {
+	supportsAudio, supportsVideo := false, false
+	if len(additional) > 0 {
+		supportsAudio = additional[0]
+	}
+	if len(additional) > 1 {
+		supportsVideo = additional[1]
+	}
 	return ModelCapabilities{
 		supportsImage: supportsImage,
 		supportsPDF:   supportsPDF,
+		supportsAudio: supportsAudio,
+		supportsVideo: supportsVideo,
 	}
 }

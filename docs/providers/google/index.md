@@ -20,6 +20,8 @@ Docker Agent reads the first credential it finds from these environment variable
 | `GOOGLE_CLOUD_PROJECT`      | GCP project used when `GOOGLE_GENAI_USE_VERTEXAI` is set or for Vertex AI Model Garden. |
 | `GOOGLE_CLOUD_LOCATION`     | GCP region for Vertex AI (defaults to the SDK default).                             |
 
+On the Gemini Developer API, a model or [custom provider](../custom/index.md) that sets `token_key` reads its key from that variable instead of `GOOGLE_API_KEY` / `GEMINI_API_KEY`. The Vertex AI backends use Application Default Credentials and ignore `token_key`.
+
 ```bash
 # Gemini Developer API
 export GOOGLE_API_KEY="AI..."   # or GEMINI_API_KEY
@@ -59,6 +61,75 @@ models:
 | `gemini-3.8-flash`        | Fast, efficient, good balance   |
 | `gemini-2.5-flash`        | Fast inference, cost-effective  |
 | `gemini-2.5-pro`          | Strong reasoning, large context |
+
+## Generated Images
+
+Some Gemini models (e.g. `gemini-2.5-flash-image`) are designed to generate
+an image directly as part of their reply, not just describe one. Docker
+Agent requests that image output on supported Google surfaces — the models
+gateway, direct Gemini API, and Vertex AI — according to one binding policy:
+explicit `false`, explicit `true`, then an exact models.dev record whose
+`Modalities.Output` contains `image`. An omitted image flag, including
+`output_capabilities: {}`, uses that catalogue default. Unknown models or
+unavailable catalogue data leave image response modalities disabled; model
+names are never used to guess capability.
+Each eligible ordinary chat request asks for text *and* image output.
+Vertex AI has deterministic guard/predicate coverage; live image-generation
+validation is deferred.
+
+Docker Agent attempts to save each returned image and display it in the TUI — see [Generated Media](../../features/tui/index.md#generated-media)
+for file naming, collision handling, and rendering details.
+
+The workspace file is the visible deliverable. After that file and its manifest
+entry are saved, a portable copy is also stored in the session database and
+preferred when the session is reopened. It can render the original generated
+bytes even if the workspace file was edited, moved, or deleted.
+Generated-media storage and resolution do not impose a size cap. If portable
+persistence fails, the workspace file is still kept and the turn includes a
+warning.
+Sessions created before portable copies were introduced continue to use their
+manifest-gated workspace files.
+
+```yaml
+models:
+  gemini-image:
+    provider: google
+    model: gemini-2.5-flash-image
+```
+
+When `output_capabilities.image` is omitted, including in an empty block,
+Docker Agent uses models.dev output modalities for the exact known model. Set
+it explicitly for custom models or to override incorrect catalogue data;
+unknown or unavailable metadata remains disabled and capability is never
+guessed from the model name.
+
+Session-title and compaction requests omit image response modalities and
+bypass the guard even for image-output-capable models. They do not explicitly
+force TEXT-only output. Ordinary image-output requests with custom function tools or
+structured output are rejected locally before any request is sent. Google
+Search, Maps, and code-execution built-ins remain available. When custom
+tools conflict, Docker Agent uses models.dev's `tool_call` capability to clarify
+whether the model cannot call tools at all or supports tools only outside an
+image-output request. Unknown catalogue data keeps the conservative generic
+message.
+
+A few provider-side behaviors to know:
+
+- **The provider decides the image format** (typically PNG). Asking for a
+  `.gif` or `.svg` filename does not transcode anything — the saved file's
+  extension is corrected to match the data actually returned.
+- **An image is not guaranteed.** Even a correctly configured image model
+  can answer with text only and generate no image. At a text-only stop,
+  phrases such as "generate an image" or "draw a picture" in the last user
+  prompt trigger a nonfatal warning while preserving the reply:
+  `The model returned text but no image for this image-generation request. Try rephrasing the request.`
+  This phrase-based check is not semantic intent detection and does not
+  check output capability: negated or quoted phrases can match and other
+  wording can be missed. It does not track a whole submission across tool
+  calls, steering, stop hooks, or handoffs. A terminal provider error skips
+  this check, as does structured output configured on the current agent
+  model; per-call overrides and reply content are not independently
+  classified.
 
 ## Thinking Budget
 

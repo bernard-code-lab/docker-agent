@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"google.golang.org/genai"
@@ -34,6 +33,12 @@ type Client struct {
 	base.Config
 
 	clientFn func(context.Context) (*genai.Client, error)
+
+	// apiSurface classifies which backend/transport this client talks to
+	// (see the apiSurface* constants in diagnostics.go), for safe
+	// request-shape diagnostics. Never exposed to the model or logged
+	// alongside anything provider-supplied.
+	apiSurface string
 }
 
 // NewClient creates a new Gemini client from the provided configuration
@@ -49,6 +54,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	globalOptions := options.Apply(opts...)
 
 	var clientFn func(context.Context) (*genai.Client, error)
+	var apiSurface string
 	if gateway := globalOptions.Gateway(); gateway == "" {
 		var (
 			httpClient *http.Client
@@ -97,21 +103,24 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			backend = genai.BackendVertexAI
 			httpClient = nil // Use ADC-managed client
 		default:
-			if value, exist := env.Get(ctx, "GEMINI_API_KEY"); exist {
-				apiKey = value
-			}
-			if value, exist := env.Get(ctx, "GOOGLE_API_KEY"); exist {
-				apiKey = value
-			}
-			if apiKey == "" {
-				return nil, errors.New("GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required")
+			var err error
+			apiKey, err = directAPIKey(ctx, cfg, env)
+			if err != nil {
+				return nil, err
 			}
 
 			backend = genai.BackendGeminiAPI
 			httpClient = httpclient.NewHTTPClient(ctx)
 		}
 
+		if backend == genai.BackendVertexAI {
+			apiSurface = apiSurfaceVertexAI
+		} else {
+			apiSurface = apiSurfaceGeminiAPI
+		}
+
 		globalOptions.WrapTransport(ctx, httpClient)
+		base.WrapOpenCodeSession(cfg, httpClient)
 
 		client, err := genai.NewClient(ctx, &genai.ClientConfig{
 			APIKey:     apiKey,
@@ -131,6 +140,8 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			return client, nil
 		}
 	} else {
+		apiSurface = apiSurfaceGateway
+
 		// When using a Gateway targeting a Docker domain, tokens are short-lived.
 		// Only require and inject the Docker JWT if the gateway is a .docker.com URL.
 		if err := base.VerifyDockerGatewayAuth(ctx, env, gateway); err != nil {
@@ -140,37 +151,23 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 
 		// When using a Gateway, tokens are short-lived.
 		clientFn = func(ctx context.Context) (*genai.Client, error) {
-			// Query a fresh auth token each time the client is used.
-			authToken, err := base.GatewayAuthToken(ctx, env, gateway)
+			// Only the gateway emits keepalive frames that the GenAI SDK rejects.
+			connection, err := base.NewGatewayClient(ctx, env, gateway, "https://generativelanguage.googleapis.com/", "/", cfg, &globalOptions, httpclient.WithSSEKeepaliveFilter())
 			if err != nil {
 				return nil, err
 			}
 
-			url, err := url.Parse(gateway)
-			if err != nil {
-				return nil, fmt.Errorf("invalid gateway URL: %w", err)
-			}
-			baseURL := fmt.Sprintf("%s://%s%s/", url.Scheme, url.Host, url.Path)
-
-			httpOptions := base.GatewayHTTPOptions(url, "https://generativelanguage.googleapis.com/", cfg, &globalOptions)
-			httpOptions = append(httpOptions, base.GatewayAuthRetry(env, gateway)...)
-
-			httpOpts := genai.HTTPOptions{
-				BaseURL: baseURL,
-			}
-			if authToken != "" {
+			httpOpts := genai.HTTPOptions{BaseURL: connection.BaseURL}
+			if connection.AuthToken != "" {
 				httpOpts.Headers = http.Header{
-					"Authorization": []string{"Bearer " + authToken},
+					"Authorization": []string{"Bearer " + connection.AuthToken},
 				}
 			}
 
-			gatewayHTTPClient := httpclient.NewHTTPClient(ctx, httpOptions...)
-			globalOptions.WrapTransport(ctx, gatewayHTTPClient)
-
 			return genai.NewClient(ctx, &genai.ClientConfig{
-				APIKey:      authToken,
+				APIKey:      connection.AuthToken,
 				Backend:     genai.BackendGeminiAPI,
-				HTTPClient:  gatewayHTTPClient,
+				HTTPClient:  connection.HTTPClient,
 				HTTPOptions: httpOpts,
 			})
 		}
@@ -184,8 +181,32 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			ModelOptions: globalOptions,
 			Env:          env,
 		},
-		clientFn: clientFn,
+		clientFn:   clientFn,
+		apiSurface: apiSurface,
 	}, nil
+}
+
+// directAPIKey resolves the Gemini API key for the direct path: the model's
+// token_key when set, otherwise GOOGLE_API_KEY or GEMINI_API_KEY.
+func directAPIKey(ctx context.Context, cfg *latest.ModelConfig, env environment.Provider) (string, error) {
+	if cfg.TokenKey != "" {
+		apiKey, _ := env.Get(ctx, cfg.TokenKey)
+		if apiKey == "" {
+			return "", fmt.Errorf("%s environment variable is required", cfg.TokenKey)
+		}
+		return apiKey, nil
+	}
+	var apiKey string
+	if value, exist := env.Get(ctx, "GEMINI_API_KEY"); exist {
+		apiKey = value
+	}
+	if value, exist := env.Get(ctx, "GOOGLE_API_KEY"); exist {
+		apiKey = value
+	}
+	if apiKey == "" {
+		return "", errors.New("GOOGLE_API_KEY or GEMINI_API_KEY environment variable is required")
+	}
+	return apiKey, nil
 }
 
 // defaultThoughtSignature is a well-known sentinel that tells Gemini to skip
@@ -403,7 +424,7 @@ func extractMimeType(dataURLPrefix string) string {
 	return "image/jpeg" // Default fallback
 }
 
-// buildConfig creates GenerateContentConfig from model config
+// BuildConfig creates GenerateContentConfig from model config.
 func (c *Client) buildConfig() *genai.GenerateContentConfig {
 	config := &genai.GenerateContentConfig{}
 	if c.ModelConfig.MaxTokens != nil {
@@ -431,7 +452,11 @@ func (c *Client) buildConfig() *genai.GenerateContentConfig {
 	// Apply thinking configuration for Gemini models.
 	// See https://ai.google.dev/gemini-api/docs/thinking
 	if c.ModelOptions.NoThinking() {
-		// NoThinking requested (e.g. title generation). For Gemini 3+ models
+		if c.ModelOptions.GeneratingTitle() {
+			return config
+		}
+
+		// NoThinking requested (e.g. MCP sampling). For Gemini 3+ models
 		// that always think, use the lowest level and bump MaxOutputTokens so
 		// internal reasoning doesn't consume the entire budget. Gemini 2.5 and
 		// older can fully disable thinking with ThinkingBudget=0.
@@ -713,6 +738,17 @@ func stringifyEnumValues(values []any) []string {
 	return out
 }
 
+// wantsImageResponseModalities reports whether this ordinary chat request
+// should ask Gemini for TEXT+IMAGE output.
+func (c *Client) wantsImageResponseModalities(imageOutputEnabled bool) bool {
+	switch c.apiSurface {
+	case apiSurfaceGateway, apiSurfaceGeminiAPI, apiSurfaceVertexAI:
+	default:
+		return false
+	}
+	return imageOutputEnabled && !c.ModelOptions.GeneratingTitle() && !c.ModelOptions.Compacting()
+}
+
 // CreateChatCompletionStream creates a streaming chat completion request
 func (c *Client) CreateChatCompletionStream(
 	ctx context.Context,
@@ -724,9 +760,16 @@ func (c *Client) CreateChatCompletionStream(
 	}
 
 	config := c.buildConfig()
+	imageOutputEnabled := c.ImageOutputEnabled(ctx)
+
+	if c.wantsImageResponseModalities(imageOutputEnabled) {
+		config.ResponseModalities = []string{string(genai.ModalityText), string(genai.ModalityImage)}
+		applyImageOutputMediaFileInstruction(config)
+	}
 
 	// Start with Google built-in tools (search, maps, code execution) from provider_opts
-	config.Tools = c.builtInTools()
+	builtInTools := c.builtInTools()
+	config.Tools = builtInTools
 
 	// Add tools to config if provided
 	if len(requestTools) > 0 {
@@ -749,15 +792,14 @@ func (c *Client) CreateChatCompletionStream(
 		if len(config.Tools) > len(allTools) {
 			config.ToolConfig.IncludeServerSideToolInvocations = new(true)
 		}
-
-		// Debug: Log the tools we're sending
-		slog.DebugContext(ctx, "Gemini tools config", "tools", config.Tools)
-		for _, tool := range config.Tools {
-			for _, fn := range tool.FunctionDeclarations {
-				slog.DebugContext(ctx, "Function", "name", fn.Name, "desc", fn.Description, "params", fn.Parameters)
-			}
-		}
 	}
+
+	if err := c.checkImageOutputRequestCompatibility(ctx, imageOutputEnabled, config, len(requestTools)); err != nil {
+		return nil, err
+	}
+
+	shape := newRequestShape(c, config, len(requestTools), imageOutputEnabled)
+	slog.DebugContext(ctx, "Gemini request shape", shape.LogAttrs()...)
 
 	contents := convertMessagesToGemini(ctx, messages, c.ID(), c.ModelOptions.ModelsDevStore(), c.CapsOverride())
 

@@ -113,6 +113,26 @@ func (r *cycleThinkingRuntime) FollowUp(_ context.Context, msg runtime.QueuedMes
 	r.followUps = append(r.followUps, msg)
 	return nil
 }
+
+func (r *cycleThinkingRuntime) CancelSteer(_ context.Context, id string) bool {
+	for i, msg := range r.steered {
+		if msg.ID == id {
+			r.steered = append(r.steered[:i], r.steered[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (r *cycleThinkingRuntime) CancelFollowUp(_ context.Context, id string) bool {
+	for i, msg := range r.followUps {
+		if msg.ID == id {
+			r.followUps = append(r.followUps[:i], r.followUps[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
 func (r *cycleThinkingRuntime) QueueStatus() runtime.QueueStatus { return runtime.QueueStatus{} }
 
 func (r *cycleThinkingRuntime) TogglePause(context.Context) (bool, error) {
@@ -232,6 +252,27 @@ func TestSessionsCommandListsCurrentDirectoryAndResumesSelection(t *testing.T) {
 	assert.Contains(t, transcript, "continue this task")
 	assert.Contains(t, transcript, "previous answer")
 	assert.NotContains(t, transcript, "Other directory")
+}
+
+func TestLoadInitialSessionTranscriptMarksRestoredUserMessages(t *testing.T) {
+	t.Parallel()
+
+	sess := session.New()
+	sess.AddMessage(session.UserMessage("restored question"))
+	sess.AddMessage(session.NewAgentMessage("coder", &chat.Message{
+		Role:    chat.MessageRoleAssistant,
+		Content: "restored answer",
+	}))
+
+	m := bareModel(80)
+	m.app = app.New(t.Context(), &cycleThinkingRuntime{}, sess)
+	m.sessionState = service.NewSessionState(sess)
+	m.loadInitialSessionTranscript()
+
+	transcript := strings.Join(m.screen.Transcript.Lines(80, 0, false, m.sessionState, nil), "\n")
+	assert.Contains(t, transcript, "\x1b]133;A;redraw=0\x07")
+	assert.Contains(t, transcript, "restored question")
+	assert.Contains(t, transcript, "restored answer")
 }
 
 func TestLoadSessionTranscriptRestoresToolCalls(t *testing.T) {
@@ -428,6 +469,37 @@ func TestEscapeInterruptsActiveRun(t *testing.T) {
 	assert.Less(t, responseAt, cancelledAt)
 }
 
+func TestEscapeFinalizesToolWithoutResponse(t *testing.T) {
+	t.Parallel()
+	m := bareModel(24)
+	m.busy = true
+	m.runCancel = func() {}
+	toolCall := tools.ToolCall{
+		ID: "call-1",
+		Function: tools.FunctionCall{
+			Name:      "edit_file",
+			Arguments: `{}`,
+		},
+	}
+	m.handleEvent(t.Context(), runtime.ToolCall(toolCall, tools.Tool{Name: "edit_file"}, "coder"))
+	m.screen.Transcript.AppendAssistant("partial response")
+
+	m.handleKey(t.Context(), ui.Key{Typ: ui.KeyEsc})
+	m.handleEvent(t.Context(), runtime.StreamStopped("session", "coder", "canceled"))
+
+	assert.Zero(t, m.screen.Transcript.ToolCount())
+	assert.Zero(t, m.screen.Transcript.ToolByIDCount())
+	transcript := strings.Join(m.screen.Transcript.Lines(80, 0, false, m.sessionState, nil), "\n")
+	responseAt := strings.Index(transcript, "partial response")
+	toolAt := strings.Index(transcript, "edit_file")
+	cancelledAt := strings.Index(transcript, "Cancelled")
+	assert.NotEqual(t, -1, responseAt)
+	assert.NotEqual(t, -1, toolAt)
+	assert.NotEqual(t, -1, cancelledAt)
+	assert.Less(t, responseAt, toolAt)
+	assert.Less(t, toolAt, cancelledAt)
+}
+
 func TestCtrlCCancelMarkerFollowsBufferedResponse(t *testing.T) {
 	t.Parallel()
 	m := bareModel(24)
@@ -489,6 +561,82 @@ func TestAltEnterWhileBusyQueuesRuntimeFollowUp(t *testing.T) {
 	assert.True(t, m.screen.Editor.IsEmpty())
 }
 
+func TestOptionUpCancelsPendingSteerAndRestoresEditor(t *testing.T) {
+	t.Parallel()
+	rt := &cycleThinkingRuntime{}
+	m := bareModel(24)
+	m.app = app.New(t.Context(), rt, session.New())
+	m.busy = true
+	m.screen.Editor.SetText("turn left")
+	m.handleEnter(t.Context())
+
+	m.handleKey(t.Context(), ui.Key{Typ: ui.KeyAltUp})
+
+	assert.Empty(t, rt.steered)
+	assert.Empty(t, m.pendingUsers)
+	assert.Equal(t, "turn left", m.screen.Editor.Text())
+	assert.True(t, m.busy)
+}
+
+func TestOptionUpCancelsPendingFollowUpAndRestoresEditor(t *testing.T) {
+	t.Parallel()
+	rt := &cycleThinkingRuntime{}
+	m := bareModel(24)
+	m.app = app.New(t.Context(), rt, session.New())
+	m.busy = true
+	m.screen.Editor.SetText("do this next")
+	m.handleKey(t.Context(), ui.Key{Typ: ui.KeyAltEnter})
+
+	m.handleKey(t.Context(), ui.Key{Typ: ui.KeyAltUp})
+
+	assert.Empty(t, rt.followUps)
+	assert.Empty(t, m.pendingUsers)
+	assert.Equal(t, "do this next", m.screen.Editor.Text())
+	assert.True(t, m.busy)
+}
+
+func TestOptionUpCancelsAllPendingMessagesAndConcatenatesThem(t *testing.T) {
+	t.Parallel()
+	rt := &cycleThinkingRuntime{}
+	m := bareModel(24)
+	m.app = app.New(t.Context(), rt, session.New())
+	m.busy = true
+
+	m.screen.Editor.SetText("first steer")
+	m.handleEnter(t.Context())
+	m.screen.Editor.SetText("then follow up")
+	m.handleKey(t.Context(), ui.Key{Typ: ui.KeyAltEnter})
+	m.screen.Editor.SetText("second steer")
+	m.handleEnter(t.Context())
+
+	m.handleKey(t.Context(), ui.Key{Typ: ui.KeyAltUp})
+
+	assert.Empty(t, rt.steered)
+	assert.Empty(t, rt.followUps)
+	assert.Empty(t, m.pendingUsers)
+	assert.Equal(t, "first steer\nthen follow up\nsecond steer", m.screen.Editor.Text())
+	assert.True(t, m.busy)
+}
+
+func TestOptionUpRestoresOnlyMessagesStillCancelable(t *testing.T) {
+	t.Parallel()
+	rt := &cycleThinkingRuntime{}
+	m := bareModel(24)
+	m.app = app.New(t.Context(), rt, session.New())
+	m.busy = true
+	m.pendingUsers = []ui.PendingUserMessage{
+		{ID: "consumed", Display: "already sent", Kind: ui.PendingUserSteer},
+		{ID: "pending", Display: "still pending", Kind: ui.PendingUserFollowUp},
+	}
+	rt.followUps = []runtime.QueuedMessage{{ID: "pending", Content: "still pending"}}
+
+	m.handleKey(t.Context(), ui.Key{Typ: ui.KeyAltUp})
+
+	assert.Empty(t, rt.followUps)
+	assert.Equal(t, "still pending", m.screen.Editor.Text())
+	assert.Equal(t, []ui.PendingUserMessage{{ID: "consumed", Display: "already sent", Kind: ui.PendingUserSteer}}, m.pendingUsers)
+}
+
 func TestEditorSubmitWhileBusySteersAndRendersAtStreamEnd(t *testing.T) {
 	t.Parallel()
 	rt := &cycleThinkingRuntime{}
@@ -520,7 +668,7 @@ func TestSteeredUserEventConfirmsPendingAfterAssistant(t *testing.T) {
 	m := bareModel(24)
 	m.busy = true
 	m.screen.Transcript.AppendAssistant("assistant response")
-	m.addPendingUser("/change", "resolved steering prompt", ui.PendingUserSteer)
+	m.addPendingUser("", "/change", "resolved steering prompt", ui.PendingUserSteer)
 
 	m.handleEvent(t.Context(), runtime.UserMessage("resolved steering prompt\n", "session", nil, 1))
 
@@ -532,4 +680,46 @@ func TestSteeredUserEventConfirmsPendingAfterAssistant(t *testing.T) {
 	assert.NotEqual(t, -1, assistantAt)
 	assert.NotEqual(t, -1, steerAt)
 	assert.Less(t, assistantAt, steerAt)
+}
+
+func TestCopyCommandCopiesLastAssistantResponse(t *testing.T) {
+	sess := session.New()
+	sess.AddMessage(session.UserMessage("question"))
+	sess.AddMessage(session.NewAgentMessage("coder", &chat.Message{
+		Role:    chat.MessageRoleAssistant,
+		Content: "the last response",
+	}))
+	m := bareModel(80)
+	m.app = app.New(t.Context(), &cycleThinkingRuntime{}, sess)
+
+	originalWriteClipboard := writeClipboard
+	t.Cleanup(func() { writeClipboard = originalWriteClipboard })
+	var copied string
+	writeClipboard = func(text string) error {
+		copied = text
+		return nil
+	}
+
+	assert.True(t, m.handleSlash(t.Context(), "/copy", busySubmitSteer))
+	assert.Equal(t, "the last response", copied)
+	transcript := strings.Join(m.screen.Transcript.Lines(80, 0, false, m.sessionState, nil), "\n")
+	assert.Contains(t, transcript, "Last response copied to clipboard.")
+}
+
+func TestCopyCommandReportsMissingAssistantResponse(t *testing.T) {
+	m := bareModel(80)
+	m.app = app.New(t.Context(), &cycleThinkingRuntime{}, session.New())
+
+	originalWriteClipboard := writeClipboard
+	t.Cleanup(func() { writeClipboard = originalWriteClipboard })
+	called := false
+	writeClipboard = func(string) error {
+		called = true
+		return nil
+	}
+
+	assert.True(t, m.handleSlash(t.Context(), "/copy", busySubmitSteer))
+	assert.False(t, called)
+	transcript := strings.Join(m.screen.Transcript.Lines(80, 0, false, m.sessionState, nil), "\n")
+	assert.Contains(t, transcript, "No assistant response to copy.")
 }

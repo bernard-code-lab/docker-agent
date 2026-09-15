@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 
@@ -81,6 +80,15 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 				option.WithAPIKey(""),
 				option.WithMiddleware(chatgptAuthMiddleware(tokenSource)),
 			)
+		case globalOptions.TokenSource() != nil:
+			tokenSource := globalOptions.TokenSource()
+			if _, err := tokenSource(ctx); err != nil {
+				return nil, fmt.Errorf("resolving access token: %w", err)
+			}
+			clientOptions = append(clientOptions,
+				option.WithAPIKey(""),
+				option.WithMiddleware(tokenAuthMiddleware(tokenSource)),
+			)
 		case cfg.TokenKey != "":
 			// Explicit token_key configured - use that env var
 			authToken, tokenKey := authTokenForTokenKey(ctx, cfg, env)
@@ -140,6 +148,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 
 		httpClient := httpclient.NewHTTPClient(ctx)
 		globalOptions.WrapTransport(ctx, httpClient)
+		base.WrapOpenCodeSession(cfg, httpClient)
 		clientOptions = append(clientOptions, option.WithHTTPClient(httpClient))
 
 		client := openai.NewClient(clientOptions...)
@@ -156,31 +165,18 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 
 		// When using a Gateway, tokens are short-lived.
 		clientFn = func(ctx context.Context) (*openai.Client, error) {
-			// Query a fresh auth token each time the client is used.
-			authToken, err := base.GatewayAuthToken(ctx, env, gateway)
+			connection, err := base.NewGatewayClient(ctx, env, gateway, "https://api.openai.com/v1", "/v1/", cfg, &globalOptions)
 			if err != nil {
 				return nil, err
 			}
 
-			url, err := url.Parse(gateway)
-			if err != nil {
-				return nil, fmt.Errorf("invalid gateway URL: %w", err)
-			}
-			baseURL := fmt.Sprintf("%s://%s%s/v1/", url.Scheme, url.Host, url.Path)
-
-			// Configure a custom HTTP client to inject headers and query params used by the Gateway.
-			httpOptions := base.GatewayHTTPOptions(url, "https://api.openai.com/v1", cfg, &globalOptions)
-			httpOptions = append(httpOptions, base.GatewayAuthRetry(env, gateway)...)
-
-			gatewayHTTPClient := httpclient.NewHTTPClient(ctx, httpOptions...)
-			globalOptions.WrapTransport(ctx, gatewayHTTPClient)
 			clientOptions := []option.RequestOption{
-				option.WithBaseURL(baseURL),
-				option.WithHTTPClient(gatewayHTTPClient),
+				option.WithBaseURL(connection.BaseURL),
+				option.WithHTTPClient(connection.HTTPClient),
 				option.WithMiddleware(oaistream.ErrorBodyMiddleware()),
 			}
-			if authToken != "" {
-				clientOptions = append(clientOptions, option.WithAPIKey(authToken))
+			if connection.AuthToken != "" {
+				clientOptions = append(clientOptions, option.WithAPIKey(connection.AuthToken))
 			}
 			client := openai.NewClient(clientOptions...)
 
@@ -202,10 +198,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	// Pre-create the WebSocket pool when the transport is configured.
 	// The pool is cheap (no connections opened until the first Stream call)
 	// and eager init avoids a data race on the lazy path.
-	// WebSocket is also skipped when an HTTP transport wrapper is registered:
-	// gorilla/websocket dials raw TCP and never calls http.RoundTripper, so the
-	// wrapper cannot be applied. Fall back to SSE so the wrapper covers all calls.
-	if getTransport(cfg) == "websocket" && globalOptions.Gateway() == "" && globalOptions.TransportWrapper() == nil {
+	if webSocketEnabled(cfg, &globalOptions) {
 		baseURL := cmp.Or(cfg.BaseURL, "https://api.openai.com/v1")
 		client.wsPool = newWSPool(httpToWSURL(baseURL), client.buildWSHeaderFn())
 	}
@@ -406,8 +399,9 @@ func (c *Client) CreateChatCompletionStream(
 	trackUsage := c.TrackUsageEnabled()
 
 	params := openai.ChatCompletionNewParams{
-		Model:    c.ModelConfig.Model,
-		Messages: c.convertMessages(ctx, messages),
+		Model:       c.ModelConfig.Model,
+		ServiceTier: openai.ChatCompletionNewParamsServiceTier(serviceTier(c.ModelConfig.ProviderOpts)),
+		Messages:    c.convertMessages(ctx, messages),
 		StreamOptions: openai.ChatCompletionStreamOptionsParam{
 			IncludeUsage: openai.Bool(trackUsage),
 		},
@@ -675,7 +669,8 @@ func (c *Client) CreateResponseStream(
 	}
 
 	params := responses.ResponseNewParams{
-		Model: c.ModelConfig.Model,
+		Model:       c.ModelConfig.Model,
+		ServiceTier: responses.ResponseNewParamsServiceTier(serviceTier(c.ModelConfig.ProviderOpts)),
 	}
 	params.Input.OfInputItemList = input
 
@@ -808,15 +803,11 @@ func (c *Client) CreateResponseStream(
 	}
 
 	// Choose transport: WebSocket or SSE (default).
-	// WebSocket is disabled when using a Gateway since most gateways don't support it.
-	// WebSocket is also disabled when an HTTP transport wrapper is registered: gorilla/websocket
-	// dials raw TCP and never calls http.RoundTripper, so the wrapper cannot intercept those
-	// connections. Fall back to SSE so the wrapper applies to all requests.
 	transport := getTransport(&c.ModelConfig)
 	trackUsage := c.TrackUsageEnabled()
 
 	switch {
-	case transport == "websocket" && c.ModelOptions.Gateway() == "" && c.ModelOptions.TransportWrapper() == nil:
+	case webSocketEnabled(&c.ModelConfig, &c.ModelOptions):
 		stream, err := c.createWebSocketStream(ctx, params)
 		if err != nil {
 			slog.WarnContext(ctx, "WebSocket stream failed, falling back to SSE", "error", err)
@@ -829,8 +820,11 @@ func (c *Client) CreateResponseStream(
 		slog.DebugContext(ctx, "WebSocket transport requested but Gateway is configured, using SSE",
 			"model", c.ModelConfig.Model,
 			"gateway", c.ModelOptions.Gateway())
-	case transport == "websocket":
+	case transport == "websocket" && c.ModelOptions.TransportWrapper() != nil:
 		slog.DebugContext(ctx, "WebSocket transport requested but HTTP transport wrapper is set, using SSE",
+			"model", c.ModelConfig.Model)
+	case transport == "websocket":
+		slog.DebugContext(ctx, "WebSocket transport requested but the endpoint is OpenCode, using SSE",
 			"model", c.ModelConfig.Model)
 	}
 
@@ -869,7 +863,13 @@ func (c *Client) buildWSHeaderFn() func(ctx context.Context) (http.Header, error
 
 		// Resolve the API key using the same logic as the HTTP client.
 		var apiKey string
-		if c.ModelConfig.TokenKey != "" {
+		if source := c.ModelOptions.TokenSource(); source != nil {
+			var err error
+			apiKey, err = source(ctx)
+			if err != nil {
+				return nil, err
+			}
+		} else if c.ModelConfig.TokenKey != "" {
 			apiKey, _ = authTokenForTokenKey(ctx, &c.ModelConfig, c.Env)
 		}
 		if apiKey == "" {
@@ -901,6 +901,16 @@ func authTokenForTokenKey(ctx context.Context, cfg *latest.ModelConfig, env envi
 		}
 	}
 	return token, cfg.TokenKey
+}
+
+// webSocketEnabled reports whether transport=websocket can be honoured. WebSocket
+// dials bypass http.RoundTripper, so SSE is used behind a gateway, under a
+// transport wrapper, and for OpenCode, whose session header needs the RoundTripper.
+func webSocketEnabled(cfg *latest.ModelConfig, opts *options.ModelOptions) bool {
+	return getTransport(cfg) == "websocket" &&
+		opts.Gateway() == "" &&
+		opts.TransportWrapper() == nil &&
+		!base.IsOpenCodeProvider(cfg)
 }
 
 // getTransport returns the streaming transport preference from ProviderOpts.
@@ -1274,7 +1284,8 @@ func (c *Client) Rerank(ctx context.Context, query string, documents []types.Doc
 	systemPrompt := prompts.BuildRerankSystemPrompt(documents, criteria, c.ModelConfig.ProviderOpts, jsonFormatInstruction)
 
 	params := openai.ChatCompletionNewParams{
-		Model: c.ModelConfig.Model,
+		Model:       c.ModelConfig.Model,
+		ServiceTier: openai.ChatCompletionNewParamsServiceTier(serviceTier(c.ModelConfig.ProviderOpts)),
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(systemPrompt),
 			openai.UserMessage(userPrompt),

@@ -15,6 +15,8 @@ _Use Claude Sonnet 5, Claude Opus 5, and other Anthropic models with Docker Agen
 export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
+When no `auth` block is configured, a model or [custom provider](../custom/index.md) that sets `token_key` reads its key from that variable instead of `ANTHROPIC_API_KEY`.
+
 ### Workload Identity Federation (no API key)
 
 Authenticate with short-lived tokens minted from your own OIDC identity
@@ -66,7 +68,7 @@ identity_token:
   response_field: value
 ```
 
-`auth:` is mutually exclusive with `--gateway`. Token-refresh failures are
+`auth:` is mutually exclusive with `--models-gateway`. Token-refresh failures are
 surfaced through the normal error path with a clear `anthropic workload
 identity federation: failed to refresh identity token from <kind> source
 (federation_rule=fdrl_…): ...` message in the TUI.

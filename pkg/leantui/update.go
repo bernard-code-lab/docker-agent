@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
+	"github.com/atotto/clipboard"
+	"github.com/google/uuid"
 
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/effort"
@@ -47,6 +49,8 @@ func (m *model) handleKey(ctx context.Context, k ui.Key) {
 		m.screen.Editor.Insert([]rune{'\n'})
 	case ui.KeyAltEnter:
 		m.submitEditorMode(ctx, m.screen.Editor.Text(), busySubmitFollowUp)
+	case ui.KeyAltUp:
+		m.cancelPendingMessages(ctx)
 	case ui.KeyTab:
 		m.handleTab()
 	case ui.KeyShiftTab:
@@ -100,6 +104,31 @@ func (m *model) handleKey(ctx context.Context, k ui.Key) {
 	m.screen.Autocomplete.Sync(m.screen.Editor.Text())
 }
 
+func (m *model) cancelPendingMessages(ctx context.Context) bool {
+	if m.app == nil || len(m.pendingUsers) == 0 {
+		return false
+	}
+
+	cancelled := make([]string, 0, len(m.pendingUsers))
+	remaining := make([]ui.PendingUserMessage, 0, len(m.pendingUsers))
+	for _, pending := range m.pendingUsers {
+		followUp := pending.Kind == ui.PendingUserFollowUp
+		if pending.ID == "" || !m.app.CancelPendingMessage(ctx, runtime.QueuedMessage{ID: pending.ID}, followUp) {
+			remaining = append(remaining, pending)
+			continue
+		}
+		cancelled = append(cancelled, pending.Display)
+	}
+	if len(cancelled) == 0 {
+		return false
+	}
+
+	m.pendingUsers = remaining
+	m.screen.Editor.SetText(strings.Join(cancelled, "\n"))
+	m.screen.Autocomplete.Sync(m.screen.Editor.Text())
+	return true
+}
+
 func (m *model) handleInterrupt() {
 	switch {
 	case m.busy:
@@ -122,6 +151,10 @@ func (m *model) handleInterrupt() {
 func (m *model) handleEnter(ctx context.Context) {
 	if m.screen.Autocomplete.Active {
 		if cmd, ok := m.screen.Autocomplete.Current(); ok {
+			if m.screen.Autocomplete.IsFileCompletion() {
+				m.completeFile(cmd)
+				return
+			}
 			completion := m.screen.Autocomplete.Completion(cmd)
 			m.screen.Autocomplete.Dismiss()
 			m.submitEditor(ctx, completion)
@@ -136,9 +169,22 @@ func (m *model) handleTab() {
 		return
 	}
 	if cmd, ok := m.screen.Autocomplete.Current(); ok {
+		if m.screen.Autocomplete.IsFileCompletion() {
+			m.completeFile(cmd)
+			return
+		}
 		m.screen.Editor.SetText(m.screen.Autocomplete.Completion(cmd) + " ")
 		m.screen.Autocomplete.Sync(m.screen.Editor.Text())
 	}
+}
+
+func (m *model) completeFile(cmd ui.Command) {
+	value := cmd.Value
+	if value == "" {
+		value = "@" + cmd.Name
+	}
+	m.screen.Editor.ReplaceCurrentWord(value + " ")
+	m.screen.Autocomplete.Dismiss()
 }
 
 func (m *model) handleCycleThinkingLevel(ctx context.Context) {
@@ -276,6 +322,9 @@ func (m *model) handleSlash(ctx context.Context, text string, mode busySubmitMod
 	case "clear":
 		m.clearScreen()
 		return true
+	case "copy":
+		m.copyLastResponse()
+		return true
 	case "help":
 		m.commitHelp()
 		return true
@@ -312,6 +361,25 @@ func (m *model) handleSlash(ctx context.Context, text string, mode busySubmitMod
 
 	return false
 }
+
+func (m *model) copyLastResponse() {
+	if m.app == nil || m.app.Session() == nil {
+		m.addNotice("", "No active session.", ui.StMuted())
+		return
+	}
+	lastResponse := m.app.Session().GetLastAssistantMessageContent()
+	if lastResponse == "" {
+		m.addNotice("", "No assistant response to copy.", ui.StMuted())
+		return
+	}
+	if m.term != nil {
+		m.term.SetClipboard(lastResponse)
+	}
+	_ = writeClipboard(lastResponse)
+	m.addNotice("", "Last response copied to clipboard.", ui.StMuted())
+}
+
+var writeClipboard = clipboard.WriteAll
 
 func (m *model) handleSessionsCommand(ctx context.Context, sessionID string) {
 	if m.busy {
@@ -409,6 +477,13 @@ func (m *model) resumeSession(ctx context.Context, sessionID string) {
 		title = sess.ID
 	}
 	m.addNotice("", "Resumed session: "+title, ui.StMuted())
+}
+
+func (m *model) loadInitialSessionTranscript() {
+	if m.app == nil || m.app.Session() == nil || len(m.app.Session().OwnMessages()) == 0 {
+		return
+	}
+	m.loadSessionTranscript(m.app.Session())
 }
 
 func (m *model) loadSessionTranscript(sess *session.Session) {
@@ -521,18 +596,20 @@ func (m *model) dispatchUserMessage(ctx context.Context, display, content string
 	if m.busy {
 		switch mode {
 		case busySubmitSteer:
-			if err := m.app.Steer(ctx, runtime.QueuedMessage{Content: content}); err != nil {
+			msg := runtime.QueuedMessage{ID: uuid.NewString(), Content: content}
+			if err := m.app.Steer(ctx, msg); err != nil {
 				m.addNotice("⚠ ", "Could not steer current response: "+err.Error(), ui.StWarning())
 				return
 			}
-			m.addPendingUser(display, content, ui.PendingUserSteer)
+			m.addPendingUser(msg.ID, display, content, ui.PendingUserSteer)
 			return
 		case busySubmitFollowUp:
-			if err := m.app.FollowUp(ctx, runtime.QueuedMessage{Content: content}); err != nil {
+			msg := runtime.QueuedMessage{ID: uuid.NewString(), Content: content}
+			if err := m.app.FollowUp(ctx, msg); err != nil {
 				m.addNotice("⚠ ", "Could not enqueue follow-up: "+err.Error(), ui.StWarning())
 				return
 			}
-			m.addPendingUser(display, content, ui.PendingUserFollowUp)
+			m.addPendingUser(msg.ID, display, content, ui.PendingUserFollowUp)
 			return
 		default:
 			m.enqueueFollowUp(display, content)
@@ -692,8 +769,8 @@ func (m *model) addUserEcho(text string) {
 	m.screen.Transcript.AddBlock(func(w int) []string { return ui.RenderUserLines(text, w) })
 }
 
-func (m *model) addPendingUser(display, content string, kind ui.PendingUserKind) {
-	m.pendingUsers = append(m.pendingUsers, ui.PendingUserMessage{Display: display, Content: content, Kind: kind})
+func (m *model) addPendingUser(id, display, content string, kind ui.PendingUserKind) {
+	m.pendingUsers = append(m.pendingUsers, ui.PendingUserMessage{ID: id, Display: display, Content: content, Kind: kind})
 }
 
 func (m *model) consumePendingUser(kind ui.PendingUserKind, content string) (ui.PendingUserMessage, bool) {
@@ -739,6 +816,7 @@ func (m *model) commitHelp() {
 			ui.StMuted().Render("  /compact   summarize and compact the conversation"),
 			ui.StMuted().Render("  /model     change the model for the current agent"),
 			ui.StMuted().Render("  /effort    set the model's reasoning effort (e.g. /effort high)"),
+			ui.StMuted().Render("  /copy      copy the last assistant response"),
 			ui.StMuted().Render("  /clear     clear the screen"),
 			ui.StMuted().Render("  /help      show this help"),
 			ui.StMuted().Render("  /exit      quit"),
@@ -747,6 +825,7 @@ func (m *model) commitHelp() {
 			ui.StMuted().Render("  Enter      send             Shift+Enter insert newline"),
 			ui.StMuted().Render("  Alt+Enter  follow up        Up/Down     history"),
 			ui.StMuted().Render("  Tab        complete command Shift+Tab   cycle thinking"),
+			ui.StMuted().Render("  Option+Up  edit all pending messages"),
 			ui.StMuted().Render("  Esc        interrupt         Ctrl+C     cancel / quit"),
 			ui.StMuted().Render("  Ctrl+W     delete previous word"),
 		}

@@ -59,7 +59,7 @@ For an agent loaded from a remote HTTP(S) configuration source, endpoints that n
 
 | Method   | Path                                | Description                                             |
 | -------- | ----------------------------------- | ------------------------------------------------------- |
-| `GET`    | `/api/sessions`                     | List all sessions                                       |
+| `GET`    | `/api/sessions`                     | List all sessions. Pass `?active=true` to return only runtimes attached to this server, with lightweight `working_dir` and `streaming` status and no session-history read. |
 | `POST`   | `/api/sessions`                     | Create a new session. Accepts an optional `title` field — when set, it is stored and LLM title generation is skipped. |
 | `GET`    | `/api/sessions/:id`                 | Get a session by ID (messages, tokens, permissions)     |
 | `GET`    | `/api/sessions/:id/status`          | Lightweight runtime state (streaming, title, agent, tokens). Requires an attached runtime. |
@@ -217,7 +217,7 @@ docker agent serve api <agent-file>|<agents-dir> [flags]
 > [!TIP]
 > **Live profiling (advanced)**
 >
-> For production diagnostics, set the `CAGENT_PPROF_ADDR` environment variable (or the hidden `--pprof-addr` flag) to a TCP address such as `127.0.0.1:6060`. Docker Agent will start a Go pprof HTTP server at `/debug/pprof/`, which you can query with `go tool pprof`. Use a loopback address — a non-loopback binding logs a security warning. This flag is intentionally hidden from `--help`.
+> For production diagnostics, set the `DOCKER_AGENT_PPROF_ADDR` environment variable (legacy `CAGENT_PPROF_ADDR` is also supported), or use the hidden `--pprof-addr` flag, with a TCP address such as `127.0.0.1:6060`. Docker Agent will start a Go pprof HTTP server at `/debug/pprof/`, which you can query with `go tool pprof`. Use a loopback address — a non-loopback binding logs a security warning. This flag is intentionally hidden from `--help`.
 
 > [!TIP]
 > **Multi-agent configs**
@@ -273,7 +273,7 @@ $ curl -X POST http://127.0.0.1:8080/api/sessions/$SID/followup \
 > [!NOTE]
 > **Discovering a run**
 >
-> Each run started with `--listen` writes a discovery record to `<data-dir>/runs/<pid>.json` containing its address and session id, so a supervising process can find a live run by session id, pid, or address.
+> Each run started with `--listen` writes a discovery record to `<data-dir>/runs/<pid>.json` containing its address and initial session id, so a supervising process can find a live run by session id, pid, or address. TUI tabs opened later are separate sessions attached to the same control plane; use `GET /api/sessions?active=true` on that address to enumerate them and read their `streaming` state without loading session history.
 
 > [!WARNING]
 > **This control plane has a fixed 1 MiB request-body cap and no built-in authentication**

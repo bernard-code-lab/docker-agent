@@ -3,6 +3,7 @@
 //
 // Available builtins:
 //
+//   - add_context           (context events)  — Go templates rendered against hook input
 //   - add_date              (turn_start)      — today's date
 //   - add_environment_info  (session_start)   — cwd, git, OS, arch
 //   - add_prompt_files      (turn_start)      — contents of prompt files,
@@ -22,7 +23,8 @@
 //     session_end) — shadow-git snapshots. Installed via
 //     [RegisterSnapshot] (separate entry point) so the embedder receives
 //     a [SnapshotController] to drive /undo, /snapshots, /reset.
-//   - redact_secrets        (pre_tool_use,
+//   - redact_secrets        (tool_input_transform
+//     or pre_tool_use,
 //     before_llm_call,
 //     tool_response_transform) — scrub secrets
 //     from tool args, outgoing chat content, and
@@ -104,6 +106,7 @@ func Register(r *hooks.Registry, opts ...Option) error {
 	}
 
 	return errors.Join(
+		r.RegisterBuiltin(AddContext, addContext),
 		r.RegisterBuiltin(AddDate, addDate),
 		r.RegisterBuiltin(AddEnvironmentInfo, addEnvironmentInfo),
 		r.RegisterBuiltin(AddPromptFiles, addPromptFiles),
@@ -132,11 +135,11 @@ type AgentDefaults struct {
 	// add_prompt_files.go.
 	AddPromptFilesDepth int
 	// RedactSecrets auto-injects the redact_secrets builtin under
-	// pre_tool_use, before_llm_call, and tool_response_transform — the
-	// three legs of the feature. Equivalent to writing those three
+	// tool_input_transform, before_llm_call, and tool_response_transform
+	// — the three legs of the feature. Equivalent to writing those three
 	// hook entries by hand; the dedup in [hooks.Executor.hooksFor]
-	// makes the auto-injection idempotent against an explicit YAML
-	// entry that already names the same builtin.
+	// makes auto-injection idempotent against an identical explicit
+	// entry (including its name and per-hook options).
 	RedactSecrets bool
 }
 
@@ -165,10 +168,6 @@ func ApplyAgentDefaults(cfg *hooks.Config, d AgentDefaults) *hooks.Config {
 	if cfg == nil {
 		cfg = &hooks.Config{}
 	}
-	cfg.ToolResponseTransform = append([]hooks.MatcherConfig{{
-		Matcher: "*",
-		Hooks:   []hooks.Hook{builtinHook(LimitLargeToolResults)},
-	}}, cfg.ToolResponseTransform...)
 	cfg.SessionEnd = append(cfg.SessionEnd, builtinHook(LimitLargeToolResults))
 	if d.AddDate {
 		cfg.TurnStart = append(cfg.TurnStart, builtinHook(AddDate))
@@ -190,8 +189,10 @@ func ApplyAgentDefaults(cfg *hooks.Config, d AgentDefaults) *hooks.Config {
 		// inject explicit entries here so the resulting effective
 		// config is self-describing (a user inspecting it sees that
 		// args, messages, and tool output are all covered, without
-		// having to read the dispatch table).
-		cfg.PreToolUse = append(cfg.PreToolUse, hooks.MatcherConfig{
+		// having to read the dispatch table). Arguments are scrubbed on
+		// tool_input_transform so the approval pipeline never sees the
+		// raw secret.
+		cfg.ToolInputTransform = append(cfg.ToolInputTransform, hooks.MatcherConfig{
 			Matcher: "*",
 			Hooks:   []hooks.Hook{builtinHook(RedactSecrets)},
 		})
@@ -201,6 +202,11 @@ func ApplyAgentDefaults(cfg *hooks.Config, d AgentDefaults) *hooks.Config {
 			Hooks:   []hooks.Hook{builtinHook(RedactSecrets)},
 		})
 	}
+	// Redact before the limiter writes oversized responses to disk.
+	cfg.ToolResponseTransform = append(cfg.ToolResponseTransform, hooks.MatcherConfig{
+		Matcher: "*",
+		Hooks:   []hooks.Hook{builtinHook(LimitLargeToolResults)},
+	})
 	if cfg.IsEmpty() {
 		return nil
 	}

@@ -62,11 +62,13 @@ import (
     dagentcfg "github.com/docker/docker-agent/pkg/config"
     dagentruntime "github.com/docker/docker-agent/pkg/runtime"
     "github.com/docker/docker-agent/pkg/embeddedchat"
+    "github.com/docker/docker-agent/pkg/embeddedchat/defaults"
 )
 
 chat, err := embeddedchat.New(ctx, embeddedchat.Config{
     // AgentSource can be a file path, raw YAML bytes, or an OCI reference.
     AgentSource: dagentcfg.NewBytesSource("agent", []byte(agentYAML)),
+    LoadOpts: defaults.Opts(),
 })
 if err != nil {
     return err
@@ -146,39 +148,13 @@ For advanced use (custom elicitation, raw event inspection), call `chat.Runtime(
 > elicitations) — both are required interface methods, matching the existing
 > no-op-able pattern already used by `OnToolsChanged`/`OnBackgroundEvent`.
 
-## Optional Provider Build Tags
-
-By default Docker Agent includes all four cloud providers (OpenAI, Anthropic, Google, Amazon Bedrock). When embedding Docker Agent in your own binary you can compile out unneeded providers — together with their transitive SDK dependencies — to reduce binary size.
-
-Each provider is gated by a negative build tag prefixed `docker_agent_` to avoid collisions with your own project's tags:
-
-| Build tag                    | Provider dropped         | Major dependency removed                          |
-| ---------------------------- | ------------------------ | ------------------------------------------------- |
-| `docker_agent_no_openai`     | OpenAI                   | `github.com/openai/openai-go`                     |
-| `docker_agent_no_anthropic`  | Anthropic                | `github.com/anthropics/anthropic-sdk-go` (partial — see note) |
-| `docker_agent_no_google`     | Google / Vertex AI       | `google.golang.org/genai`, Vertex auth stack, and indirectly the Anthropic and OpenAI SDKs via Vertex Model Garden |
-| `docker_agent_no_bedrock`    | Amazon Bedrock           | `github.com/aws/aws-sdk-go-v2` stack (the largest provider dependency tree) |
-
-To build without Bedrock and OpenAI:
-
-```bash
-go build -tags 'docker_agent_no_bedrock docker_agent_no_openai' ./...
-```
-
-Requesting a model whose provider was compiled out fails at construction time with a clear `"not compiled into this build"` error. The `dmr` (Docker Model Runner) provider and the rule-based router are always compiled in.
-
-> [!WARNING]
-> **Anthropic + Google dependency**
->
-> The Google provider's Vertex Model Garden support also imports the Anthropic SDK, so the Anthropic dependency is only fully removed when _both_ `docker_agent_no_anthropic` and `docker_agent_no_google` are set.
-
 ## RAG Toolset (opt-out)
 
 The RAG toolset (`type: rag`) is included in `NewDefaultToolsetRegistry()` (from `pkg/teamloader/toolsets`) and `loaderdefaults.Opts()` (from `pkg/teamloader/defaults`, using the conventional import alias `loaderdefaults`).
 
 The underlying tree-sitter code parser uses cgo, but build-tag guards in `pkg/rag/treesitter` mean importing the package is safe regardless of `CGO_ENABLED`: with `CGO_ENABLED=0` the parser stub compiles in and returns a runtime error on first use rather than failing at compile time.
 
-If you want to exclude the RAG toolset from your binary entirely — surfacing a load-time warning on the agent rather than a deferred runtime error from the `!cgo` stub — remove it from the registry before passing it to `teamloader.Load`:
+To disable the RAG toolset at runtime — surfacing a load-time warning rather than a deferred error from the `!cgo` stub — remove it from the registry before passing it to `teamloader.Load`. This does not remove its package dependencies; use a hand-picked registry without importing the full defaults for that:
 
 ```go
 import (
@@ -206,7 +182,7 @@ import (
     "github.com/docker/docker-agent/pkg/model/provider"
     "github.com/docker/docker-agent/pkg/model/provider/anthropic"
     "github.com/docker/docker-agent/pkg/teamloader"
-    "github.com/docker/docker-agent/pkg/tools/builtin/api"
+    "github.com/docker/docker-agent/pkg/tools/builtin/api/client"
     "github.com/docker/docker-agent/pkg/tools/builtin/think"
 )
 
@@ -215,7 +191,7 @@ team, err := teamloader.Load(ctx, ocisource.New("myorg/agent:v1"), runConfig,
         "anthropic": provider.Adapt(anthropic.NewClient),
     })),
     teamloader.WithToolsetRegistry(teamloader.NewToolsetRegistry(map[string]teamloader.ToolsetCreator{
-        "api":   api.Creator,
+        "api":   client.Creator(teamloader.NewEnvExpander),
         "think": teamloader.Creator(think.CreateToolSet),
     })),
     // Deny every optional feature; pass e.g. config.FeatureSkills to allow one.
@@ -237,6 +213,65 @@ team, err := teamloader.Load(ctx, ocisource.New("myorg/agent:v1"), runConfig,
 > `config.Resolve`, `config.ResolveSources`, `config.ResolveAlias` and `config.BuiltinAgentNames` are now in `pkg/config/sources`; `config.NewOCISource` is `ocisource.New` in `pkg/config/ocisource`; and `config.Load` no longer auto-detects HCL — wrap the source with `hcl.NewSource` (which `sources.Resolve` does for you). `teamloader.ToolsetRegistry` gained a `Has(toolsetType string) bool` method.
 >
 > If you call `teamloader.Load` without `loaderdefaults.Opts()`, JavaScript expansion, code mode, TOON, deferred tools and harness agents are now off until you enable them (see *Optional loader features* above). Code-built teams that use `harness:` agents must call `runtime.RegisterHarness(codingharness.Factory)`; `codingharness.Label` moved into the runtime.
+
+### Per-runtime feature configuration
+
+Prefer instance options over `runtime.RegisterHarness` and
+`runtime.RegisterCommandEvaluator`, which affect the entire process:
+
+```go
+rt, err := runtime.New(ctx, team,
+    runtime.WithProviderRegistry(providers),
+    runtime.WithHarnessFactory(codingharness.Factory),
+    runtime.WithCommandEvaluatorFactory(jscommands.Factory),
+)
+```
+
+Import `pkg/codingharness` or `pkg/runtime/jscommands` only when needed.
+Passing `nil` to either factory option explicitly disables that feature for
+this runtime, even if another caller registered a global default. Omitting the
+options retains the legacy global fallback, including registrations made after
+runtime construction. Factories are still invoked lazily, at execution time.
+Runtime decorators used with `ResolveCommand` should forward
+`CommandEvaluatorFactory() runtime.CommandEvaluatorFactory` to preserve this
+selection. The `runtime.Runtime` interface itself is unchanged.
+
+These options also work through `embeddedchat.Config.RuntimeOptions`. Loader
+policy remains separate: `teamloader.WithStrict(config.FeatureHarness)` permits
+harness declarations but does not install a driver. Likewise, supplying an
+implementation does not automatically authorize a feature in strict mode.
+
+### HTTP tools without JavaScript
+
+The `pkg/tools/builtin/api/client` package accepts an expander instead of
+importing JavaScript. Register a placeholder-only HTTP tool with:
+
+```go
+"api": client.Creator(teamloader.NewEnvExpander),
+```
+
+This supports `${env.NAME}` and bound `${argument}` placeholders and resolves
+credentials on each request. Unknown placeholders and JavaScript expressions
+remain unchanged. `api.Creator` and `api.New` retain the full JavaScript and
+upstream-header behavior for existing callers. The leaf package does **not**
+automatically expand `${headers.NAME}`; use `client.WithHeaderResolver` to supply
+that policy. Passing `upstream.ResolveHeaders` restores the legacy behavior but
+also imports JavaScript.
+
+A complete placeholder-only example lives in
+[examples/golibrary/leanapi](https://github.com/docker/docker-agent/tree/main/examples/golibrary/leanapi).
+The older `yamlstrict` example intentionally retains JavaScript-capable API and
+fetch tools.
+
+Selecting the leaf removes four external modules from the HTTP tool's import
+closure: Goja, regexp2, go-sourcemap, and pprof. Importing the full defaults and
+then deleting registry entries does **not** remove those package dependencies.
+
+Go package dependencies and module requirements are different: these changes
+reduce the packages compiled and their required source modules. Docker Agent
+still has one `go.mod`, so this does not promise an equally small
+`go list -m all` graph or a small `go mod download all`. Independently versioned
+optional modules would be a separate packaging change.
 
 ## Registering Custom Built-in Themes
 
@@ -376,7 +411,7 @@ func run(ctx context.Context) error {
 
     // Create team and runtime
     t := team.New(team.WithAgents(assistant))
-    rt, err := runtime.New(t)
+    rt, err := runtime.New(ctx, t)
     if err != nil {
         return err
     }
@@ -406,9 +441,10 @@ package main
 
 import (
     "context"
-    "encoding/json"
     "fmt"
 
+    "github.com/docker/docker-agent/pkg/agent"
+    "github.com/docker/docker-agent/pkg/model/provider"
     "github.com/docker/docker-agent/pkg/tools"
 )
 
@@ -419,9 +455,11 @@ type AddNumbersArgs struct {
 }
 
 // Implement the tool handler
-func addNumbers(_ context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
+func addNumbers(ctx context.Context, toolCall tools.ToolCall, _ tools.Runtime) (*tools.ToolCallResult, error) {
     var args AddNumbersArgs
-    if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
+    // Use tools.UnmarshalToolArguments instead of encoding/json directly so
+    // aijson repairs (and repair telemetry) apply to tool-call arguments.
+    if err := tools.UnmarshalToolArguments(ctx, toolCall, &args); err != nil {
         return nil, err
     }
 
@@ -429,7 +467,7 @@ func addNumbers(_ context.Context, toolCall tools.ToolCall) (*tools.ToolCallResu
     return tools.ResultSuccess(fmt.Sprintf("%d", result)), nil
 }
 
-func main() {
+func createCalculator(llm provider.Provider) *agent.Agent {
     // Create the tool definition
     addTool := tools.Tool{
         Name:        "add",
@@ -440,13 +478,12 @@ func main() {
     }
 
     // Use with an agent
-    calculator := agent.New(
+    return agent.New(
         "root",
         "You are a calculator. Use the add tool for arithmetic.",
         agent.WithModel(llm),
         agent.WithTools(addTool),
     )
-    // ...
 }
 ```
 
@@ -500,8 +537,9 @@ package main
 
 import (
     "github.com/docker/docker-agent/pkg/agent"
+    "github.com/docker/docker-agent/pkg/model/provider"
     "github.com/docker/docker-agent/pkg/team"
-    "github.com/docker/docker-agent/pkg/tools/builtin"
+    "github.com/docker/docker-agent/pkg/tools/builtin/transfertask"
 )
 
 func createTeam(llm provider.Provider) *team.Team {
@@ -520,7 +558,7 @@ func createTeam(llm provider.Provider) *team.Team {
         agent.WithModel(llm),
         agent.WithDescription("Team coordinator"),
         agent.WithSubAgents(researcher),
-        agent.WithToolSets(builtin.NewTransferTaskTool()),
+        agent.WithToolSets(transfertask.New()),
     )
 
     return team.New(team.WithAgents(coordinator, researcher))
@@ -533,8 +571,15 @@ Use Docker Agent's built-in tools:
 
 ```go
 import (
+    "os"
+
+    "github.com/docker/docker-agent/pkg/agent"
     "github.com/docker/docker-agent/pkg/config"
-    "github.com/docker/docker-agent/pkg/tools/builtin"
+    "github.com/docker/docker-agent/pkg/model/provider"
+    "github.com/docker/docker-agent/pkg/tools/builtin/filesystem"
+    "github.com/docker/docker-agent/pkg/tools/builtin/shell"
+    "github.com/docker/docker-agent/pkg/tools/builtin/think"
+    "github.com/docker/docker-agent/pkg/tools/builtin/todo"
 )
 
 func createAgentWithBuiltinTools(llm provider.Provider) *agent.Agent {
@@ -551,13 +596,13 @@ func createAgentWithBuiltinTools(llm provider.Provider) *agent.Agent {
         agent.WithModel(llm),
         agent.WithToolSets(
             // Shell tool for running commands
-            builtin.NewShellTool(os.Environ(), rtConfig),
+            shell.New(os.Environ(), rtConfig),
             // Filesystem tools
-            builtin.NewFilesystemTool(rtConfig.Config.WorkingDir),
+            filesystem.New(rtConfig.Config.WorkingDir),
             // Think tool for reasoning
-            builtin.NewThinkTool(),
+            think.New(),
             // Todo tool for task tracking
-            builtin.NewTodoTool(),
+            todo.New(),
         ),
     )
 }

@@ -24,7 +24,7 @@ func (r *LocalRuntime) runHarnessAgent(ctx context.Context, sess *session.Sessio
 	ctx, span := r.startSpan(ctx, "runtime.harness", trace.WithAttributes(traceAttributesForHarness(sess, a)...))
 	defer span.End()
 
-	provider, err := newHarnessProvider(a.Harness())
+	provider, err := r.newHarnessProvider(a.Harness())
 	if err != nil {
 		msg := fmt.Sprintf("failed to configure harness: %v", err)
 		events.Emit(ErrorWithCodeForSession(sess.ID, ErrorCodeModelError, msg))
@@ -45,7 +45,7 @@ func (r *LocalRuntime) runHarnessAgent(ctx context.Context, sess *session.Sessio
 		r.executeTurnEndHooks(context.WithoutCancel(ctx), sess, a, endReason, events)
 	}()
 
-	// Harnesses own their context; run lifecycle hooks but do not forward injected instructions.
+	// Harnesses accept one user prompt; run lifecycle hooks but do not forward injected instructions.
 	r.executeTurnStartHooks(ctx, sess, a, events)
 	harnessSessionID := harnessSessionIDFor(sess, a)
 	messages := harnessInputMessages(sess, harnessSessionID)
@@ -60,7 +60,9 @@ func (r *LocalRuntime) runHarnessAgent(ctx context.Context, sess *session.Sessio
 	if rewritten != nil {
 		messages = rewritten
 	}
-	messages = r.applyBeforeLLMCallTransforms(ctx, sess, a, modelID, messages)
+	// Harness labels are not models.dev identities and carry no resolved
+	// capabilities; capability-gated transforms skip on nil.
+	messages = r.applyBeforeLLMCallTransforms(ctx, sess, a, modelID, nil, messages)
 	prompt := strings.TrimSpace(harnessPrompt(messages))
 	if prompt == "" {
 		msg := "cannot run external harness without a user prompt"
@@ -508,10 +510,16 @@ func harnessMessageContent(msg chat.Message) string {
 			if part.Document == nil {
 				continue
 			}
+			// Document metadata can originate from a provider or a persisted
+			// session, so sanitize it before interpolating it into the prompt.
+			safeName := chat.SanitizeDisplayName(part.Document.Name)
+			if safeName == "" {
+				safeName = fallbackDisplayName
+			}
 			if part.Document.Source.InlineText != "" {
-				parts = append(parts, fmt.Sprintf("Attached document %s:\n%s", part.Document.Name, part.Document.Source.InlineText))
+				parts = append(parts, fmt.Sprintf("Attached document %s:\n%s", safeName, part.Document.Source.InlineText))
 			} else {
-				parts = append(parts, fmt.Sprintf("Attached document: %s (%s)", part.Document.Name, part.Document.MimeType))
+				parts = append(parts, fmt.Sprintf("Attached document: %s (%s)", safeName, sanitizeMimeType(part.Document.MimeType)))
 			}
 		}
 	}

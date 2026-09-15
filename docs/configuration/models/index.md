@@ -32,12 +32,16 @@ models:
     token_key: string # Optional: env var for API token
     thinking_budget: string|int # Optional: reasoning effort
     task_budget: int|object # Optional: total task token budget (Anthropic)
-    parallel_tool_calls: boolean # Optional: allow parallel tool calls
+    parallel_tool_calls: boolean # Optional: allow parallel tool calls. Omit to use the provider/API default.
     track_usage: boolean # Optional: track token usage
     routing: [list] # Optional: rule-based model routing
-    capabilities: # Optional: override attachment capabilities
+    capabilities: # Optional: override attachment (input) capabilities
       image: boolean # Optional: whether the model accepts image attachments
       pdf: boolean # Optional: whether the model accepts PDF attachments
+      audio: boolean # Optional: whether the model accepts audio attachments
+      video: boolean # Optional: whether the model accepts video attachments
+    output_capabilities: # Optional: override generative output capabilities (otherwise detected from models.dev)
+      image: boolean # Optional: whether the model can generate image output
     cost: # Optional: explicit token pricing (USD per 1M tokens)
       input: float # Optional: price per 1M input tokens
       output: float # Optional: price per 1M output tokens
@@ -68,10 +72,11 @@ models:
 | `token_key`           | string     | ✗        | Environment variable name containing the API token (overrides provider default)       |
 | `thinking_budget`     | string/int | ✗        | Reasoning effort control                                                              |
 | `task_budget`         | int/object | ✗        | Total token budget for an agentic task (forwarded to Anthropic; see [Task Budget](#task-budget)). |
-| `parallel_tool_calls` | boolean    | ✗        | Allow model to call multiple tools at once                                            |
+| `parallel_tool_calls` | boolean    | ✗        | Allow model to call multiple tools at once. When omitted, Docker Agent leaves the setting unset so the selected provider or API can apply its own default. |
 | `track_usage`         | boolean    | ✗        | Track and report token usage for this model                                           |
 | `routing`             | array      | ✗        | Rule-based routing to different models. See [Model Routing](../routing/index.md). |
-| `capabilities`        | object     | ✗        | Override attachment capabilities for this model. See [Attachment Capability Overrides](#attachment-capability-overrides). |
+| `capabilities`        | object     | ✗        | Override attachment (input) capabilities for this model. See [Attachment Capability Overrides](#attachment-capability-overrides). |
+| `output_capabilities` | object     | ✗        | Override generative output capabilities for this model, e.g. image generation. Omitted flags are detected from models.dev; explicit values take precedence. Cannot be combined with `first_available`. See [Output Capabilities](#output-capabilities). |
 | `cost`                | object     | ✗        | Explicit token pricing in USD per 1M tokens, overriding the built-in catalogue. See [Custom Token Pricing](#custom-token-pricing). |
 | `provider_opts`       | object     | ✗        | Provider-specific options (see provider pages)                                        |
 | `title_model`         | string     | ✗        | Model used for session-title generation. Can be a named model from the `models:` section or an inline `provider/model` string. When omitted, the agent's primary model generates titles. Cannot be combined with `first_available`. |
@@ -83,9 +88,9 @@ models:
 
 For custom OpenAI-compatible providers, local models (Ollama, DMR), and any
 model the built-in catalogue does not describe, Docker Agent cannot
-auto-detect whether the endpoint accepts image or PDF attachments. When the
-model is absent from the catalogue, Docker Agent logs a diagnostic and falls
-back to text-only, silently dropping attachments.
+auto-detect whether the endpoint accepts image, PDF, audio, or video
+attachments. When the model is absent from the catalogue, Docker Agent logs a
+diagnostic and falls back to text-only, silently dropping attachments.
 
 Declare `capabilities` to make the model's attachment support authoritative
 and skip the catalogue lookup entirely:
@@ -105,25 +110,103 @@ models:
     capabilities:
       image: true
       pdf: true
+
+  proxy-multimodal:
+    provider: vision-proxy
+    model: gemini-2.5-pro
+    capabilities:
+      image: true
+      pdf: true
+      audio: true
+      video: true
 ```
 
 | Field                  | Type    | Description                                       |
-| ---------------------- | ------- | ------------------------------------------------- |
+| ---------------------- | ------- | -------------------------------------------------- |
 | `capabilities.image`   | boolean | Whether the model accepts image attachments       |
 | `capabilities.pdf`     | boolean | Whether the model accepts PDF attachments         |
+| `capabilities.audio`   | boolean | Whether the model accepts audio attachments       |
+| `capabilities.video`   | boolean | Whether the model accepts video attachments       |
 
 The flags must match what the endpoint actually accepts. Claiming a modality
 that the endpoint does not support leads to a provider-side API error. When
 `capabilities` is omitted the behaviour is unchanged (catalogue lookup then
 conservative text-only fallback).
 
-See [`examples/capability-overrides.yaml`](https://github.com/docker/docker-agent/blob/main/examples/capability-overrides.yaml) for a complete example.
+### Unsupported media is stripped before the call
+
+Before each model call, Docker Agent removes image, audio, and video message
+parts that the resolved capabilities of the active model do not cover, instead
+of letting the provider fail the whole request. Adjacent text (and PDF) parts
+are preserved in their original order, and each stripped part is reported in
+the debug log (`--debug`) with its media kind and reason.
+
+The stripping decision uses the same capability resolution as attachment
+routing: an explicit `capabilities` declaration is authoritative, so a model
+declared with `audio: true` keeps its audio parts even when the catalogue says
+otherwise. Models absent from the catalogue (without an override) resolve to
+the conservative text-only default and have their media parts stripped.
+
+See [`examples/capability-overrides.yaml`](https://github.com/docker/docker-agent/blob/main/examples/capability-overrides.yaml) for a complete example, and
+[`examples/strip-unsupported-media.yaml`](https://github.com/docker/docker-agent/blob/main/examples/strip-unsupported-media.yaml) for a fixture demonstrating the
+stripping behaviour with and without an override.
+
+### Output capabilities
+
+`output_capabilities` overrides what a model can generate, as opposed to
+`capabilities`, which overrides what it accepts as input. Resolution follows
+one precedence chain: explicit `false`, explicit `true`, then an exact
+models.dev record whose `Modalities.Output` contains `image`. An omitted image
+flag (including `output_capabilities: {}`) therefore uses catalogue metadata;
+an unknown model or unavailable catalogue leaves image output disabled. Docker
+Agent never infers this capability from the model name.
+
+```yaml
+models:
+  gemini-image:
+    provider: google
+    model: gemini-2.5-flash-image
+    output_capabilities:
+      image: true # this model is declared able to generate image output
+```
+
+| Field                       | Type    | Description                                                  |
+| --------------------------- | ------- | -------------------------------------------------------------|
+| `output_capabilities.image` | boolean | Whether the model is declared able to generate image output  |
+
+Omitting `output_capabilities`, using an empty block, or omitting `image` uses
+models.dev metadata for that exact model when available. Setting `image`
+explicitly overrides the catalogue; an explicit `false` has highest precedence
+and disables image response modalities even when the catalogue lists image
+output. Enabling image output only opts the model into behavior that keys off
+that capability (for example, a provider-specific image-output request
+contract); it does not guarantee that a provider will return an image.
+
+Session-title and compaction requests omit image response modalities and
+bypass the guard even for image-output-capable models; they do not explicitly
+force TEXT-only output. On supported Google surfaces, the guard runs only when
+image output resolves as enabled and an ordinary request includes custom tools
+or structured output; matching requests are rejected locally. Google
+server-side built-ins remain available. For a custom-tool conflict,
+models.dev's `tool_call` capability makes the error say
+whether the model lacks tool calls entirely or only cannot combine them with
+image output; unavailable metadata keeps a conservative generic message.
+
+> [!WARNING]
+> **Constraint**
+>
+> `output_capabilities` cannot be combined with `first_available` model selection — the combination is rejected at validation time. Declare it on the concrete candidate models instead.
+
+See [`examples/gemini_image_output.yaml`](https://github.com/docker/docker-agent/blob/main/examples/gemini_image_output.yaml) for a complete example.
 
 ## Custom Token Pricing
 
 Docker Agent prices each model call from the [models.dev](https://models.dev/)
-catalogue. Models the catalogue does not know — custom OpenAI-compatible
-providers, local models, private deployments — are "unpriced": every call is
+catalogue, including long-context tiers. When the total prompt (fresh, cached,
+and cache-written input) exceeds a tier's threshold, its rates apply to the
+whole call. Thresholds are model-specific: for example, GPT-5.4 uses 272k tokens
+and Gemini 2.5 Pro uses 200k. Models the catalogue does not know — custom
+OpenAI-compatible providers, local models, private deployments — are "unpriced": every call is
 recorded at $0 despite consuming tokens, with only a log warning.
 
 Declare `cost` to price a model explicitly, in **USD per one million tokens**.

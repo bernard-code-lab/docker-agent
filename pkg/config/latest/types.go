@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -64,6 +65,8 @@ type Config struct {
 	// only carries the section so it round-trips — see config.applyFlavors
 	// for the merge semantics.
 	Flavors map[string]map[string]any `json:"flavors,omitempty"`
+
+	modelOverrideState any
 }
 
 // BudgetConfig caps what a single run may consume before the agent is
@@ -126,6 +129,16 @@ func (b *BudgetConfig) validate() error {
 		return fmt.Errorf("max_time must not be negative, got %s", b.MaxTime.Duration)
 	}
 	return nil
+}
+
+// Bool returns a pointer to value. It is primarily useful in configuration
+// literals where a nil pointer means no override.
+//
+// Deprecated: use new(value) in new code.
+//
+//nolint:modernize // Compatibility API for configuration literals.
+func Bool(value bool) *bool {
+	return &value
 }
 
 // SafetyMode is a declarative safety-mode default that agent authors
@@ -729,14 +742,15 @@ type AgentConfig struct {
 	// session. Takes precedence over the config-wide RuntimeDefaults.Safety.
 	Safety SafetyMode `json:"safety,omitempty" yaml:"safety,omitempty"`
 	// RedactSecrets enables every leg of the redact_secrets feature:
-	// the pre_tool_use builtin (scrubs tool arguments), the
-	// before_llm_call hook (scrubs outgoing chat content), and the
-	// tool_response_transform hook (scrubs tool output before it
-	// reaches event consumers, the persisted session, the post_tool_use
-	// hook, or the next LLM call). Equivalent to writing all three
-	// hook entries by hand — the runtime auto-injects them when this
-	// flag is true. See pkg/hooks/builtins/redact_secrets.go for the
-	// hook-side implementation.
+	// the tool_input_transform builtin (scrubs tool arguments before
+	// approval), the before_llm_call hook (scrubs outgoing chat
+	// content), and the tool_response_transform hook (scrubs tool
+	// output before it reaches event consumers, the persisted session,
+	// the post_tool_use hook, or the next LLM call). Equivalent to
+	// writing all three hook entries by hand — the runtime auto-injects
+	// them when this flag is true. See
+	// pkg/hooks/builtins/redact_secrets.go for the hook-side
+	// implementation.
 	//
 	// Pointer (tri-state) so we can distinguish "unset" (nil → default
 	// on) from "explicitly disabled" (false). Use
@@ -826,14 +840,17 @@ const SkillSourceLocal = "local"
 
 // errSkillsFormat is returned when the `skills` value is neither a boolean nor
 // a list of strings and/or inline skill definitions.
-var errSkillsFormat = errors.New("skills must be a boolean or a list of skill sources, names, and/or inline skill definitions")
+var (
+	errSkillsFormat       = errors.New("skills must be a boolean or a list of skill sources, names, and/or inline skill definitions")
+	errInvalidInlineSkill = errors.New("invalid inline skill")
+)
 
 // skillsFormatError maps a list-decode failure to a user-facing error. When the
 // failure carries a specific inline-skill diagnostic (an unknown/misspelled
 // field surfaced by skillListItem), that detail is preserved; otherwise the
 // generic shape hint is returned.
 func skillsFormatError(err error) error {
-	if err != nil && strings.Contains(err.Error(), "invalid inline skill") {
+	if errors.Is(err, errInvalidInlineSkill) {
 		return err
 	}
 	return errSkillsFormat
@@ -955,7 +972,7 @@ func (i *skillListItem) UnmarshalYAML(unmarshal func(any) error) error {
 	// than the generic errSkillsFormat so the user can see what's wrong.
 	var inline InlineSkill
 	if err := unmarshal(&inline); err != nil {
-		return fmt.Errorf("invalid inline skill: %w", err)
+		return fmt.Errorf("%w: %w", errInvalidInlineSkill, err)
 	}
 	i.inline = &inline
 	return nil
@@ -969,7 +986,7 @@ func (i *skillListItem) UnmarshalJSON(data []byte) error {
 	}
 	var inline InlineSkill
 	if err := json.Unmarshal(data, &inline); err != nil {
-		return fmt.Errorf("invalid inline skill: %w", err)
+		return fmt.Errorf("%w: %w", errInvalidInlineSkill, err)
 	}
 	i.inline = &inline
 	return nil
@@ -1220,9 +1237,15 @@ type ModelConfig struct {
 	// of 0.9 applies. Useful next to CompactionModel: a model that compacts
 	// with a slower/smaller summarizer may want to trigger earlier.
 	CompactionThreshold *float64 `json:"compaction_threshold,omitempty"`
-	// Capabilities optionally declares the model's attachment capabilities,
-	// overriding the automatic models.dev-based detection. See [CapabilitiesConfig].
+	// Capabilities optionally declares the model's attachment (input)
+	// capabilities, overriding the automatic models.dev-based detection. See
+	// [CapabilitiesConfig].
 	Capabilities *CapabilitiesConfig `json:"capabilities,omitempty"`
+	// OutputCapabilities optionally overrides the model's generative *output*
+	// capabilities. Explicit false takes precedence over explicit true; an
+	// omitted Image flag (including an empty block) falls back to the exact
+	// models.dev record, and unknown or unavailable metadata stays disabled.
+	OutputCapabilities *OutputCapabilitiesConfig `json:"output_capabilities,omitempty"`
 	// Cost optionally declares the model's token pricing explicitly,
 	// overriding the models.dev catalogue. See [CostConfig].
 	Cost *CostConfig `json:"cost,omitempty"`
@@ -1272,7 +1295,8 @@ func (c *CostConfig) validate() error {
 // catalogue). It exists for models the catalogue does not describe correctly:
 // custom OpenAI-compatible providers, local models (e.g. Ollama), and model
 // versions that have been dropped from the catalogue. Without it, such models
-// fall back to text-only and their image/PDF attachments are silently dropped.
+// fall back to text-only and their image/PDF/audio/video attachments are
+// silently dropped.
 //
 // When set, the declared flags are authoritative and no models.dev lookup is
 // performed. When nil (the default), capabilities are detected from models.dev.
@@ -1283,6 +1307,19 @@ type CapabilitiesConfig struct {
 	Image bool `json:"image,omitempty"`
 	// PDF reports whether the model accepts PDF (application/pdf) attachments.
 	PDF bool `json:"pdf,omitempty"`
+	// Audio reports whether the model accepts audio attachments.
+	Audio bool `json:"audio,omitempty"`
+	// Video reports whether the model accepts video attachments.
+	Video bool `json:"video,omitempty"`
+}
+
+// OutputCapabilitiesConfig overrides model generative *output* capabilities.
+// A nil flag defers to models.dev, while an explicit true or false is
+// authoritative. Custom models not found in the catalogue conservatively
+// resolve as unable to generate image output.
+type OutputCapabilitiesConfig struct {
+	// Image reports whether the model can generate image output.
+	Image *bool `json:"image,omitempty"`
 }
 
 // IsFirstAvailable reports whether this model is a first-available selector
@@ -1462,6 +1499,7 @@ func (f *FlexibleModelConfig) isShorthandOnly() bool {
 		f.CompactionModel == "" &&
 		f.CompactionThreshold == nil &&
 		f.Capabilities == nil &&
+		f.OutputCapabilities == nil &&
 		f.Cost == nil
 }
 
@@ -2765,6 +2803,28 @@ type HooksConfig struct {
 	// pre_tool_use / post_tool_use.
 	ToolResponseTransform HookMatcherConfigs `json:"tool_response_transform,omitempty" yaml:"tool_response_transform,omitempty"`
 
+	// ToolInputTransform hooks run before every tool call, ahead of the
+	// deterministic approval pipeline (safety mode, permission rules,
+	// --yolo) and of tool_guard. Hooks run sequentially and may patch
+	// tool arguments via HookSpecificOutput.updated_input, exactly like
+	// pre_tool_use; the approval pipeline and every later hook see the
+	// rewritten arguments. Verdicts belong on tool_guard. Failures follow
+	// on_error (default warn). Tool-matched; preempt_yolo is rejected
+	// here because the event always preempts approval.
+	ToolInputTransform HookMatcherConfigs `json:"tool_input_transform,omitempty" yaml:"tool_input_transform,omitempty"`
+
+	// ToolGuard hooks run after tool_input_transform and before the
+	// deterministic approval pipeline, so their verdict cannot be
+	// bypassed by any safety mode or permission allow-rule. Hooks run
+	// concurrently; permission_decision verdicts aggregate to the most
+	// restrictive (deny > ask > allow). Deny rejects the call, ask forces
+	// the user prompt even when the session already allowed the tool,
+	// allow is advisory. metadata is merged into the confirmation
+	// prompt. updated_input is ignored — use tool_input_transform. Hook
+	// failures fail closed (deny). Tool-matched; preempt_yolo is
+	// rejected here because the event always preempts approval.
+	ToolGuard HookMatcherConfigs `json:"tool_guard,omitempty" yaml:"tool_guard,omitempty"`
+
 	// WorktreeCreate hooks run once, just after `docker agent run
 	// --worktree` creates a git worktree and before the session starts.
 	// They execute inside the new worktree (their working directory is
@@ -2776,39 +2836,6 @@ type HooksConfig struct {
 	// (decision="block" / continue=false / exit code 2); stdout is added
 	// as context.
 	WorktreeCreate HookDefinitions `json:"worktree_create,omitempty" yaml:"worktree_create,omitempty"`
-}
-
-// IsEmpty returns true if no hooks are configured
-func (h *HooksConfig) IsEmpty() bool {
-	if h == nil {
-		return true
-	}
-	return len(h.PreToolUse) == 0 &&
-		len(h.PostToolUse) == 0 &&
-		len(h.PermissionRequest) == 0 &&
-		len(h.SessionStart) == 0 &&
-		len(h.UserPromptSubmit) == 0 &&
-		len(h.UserSteeringMessagesSubmit) == 0 &&
-		len(h.UserFollowupSubmit) == 0 &&
-		len(h.TurnStart) == 0 &&
-		len(h.TurnEnd) == 0 &&
-		len(h.BeforeLLMCall) == 0 &&
-		len(h.AfterLLMCall) == 0 &&
-		len(h.SessionEnd) == 0 &&
-		len(h.PreCompact) == 0 &&
-		len(h.SubagentStop) == 0 &&
-		len(h.OnUserInput) == 0 &&
-		len(h.Stop) == 0 &&
-		len(h.Notification) == 0 &&
-		len(h.OnError) == 0 &&
-		len(h.OnMaxIterations) == 0 &&
-		len(h.OnAgentSwitch) == 0 &&
-		len(h.OnSessionResume) == 0 &&
-		len(h.OnToolApprovalDecision) == 0 &&
-		len(h.BeforeCompaction) == 0 &&
-		len(h.AfterCompaction) == 0 &&
-		len(h.ToolResponseTransform) == 0 &&
-		len(h.WorktreeCreate) == 0
 }
 
 // HookMatcherConfig represents a hook matcher with its hooks.
@@ -2828,7 +2855,7 @@ type HookMatcherConfig struct {
 	// permission allow-rules; an allow verdict is advisory (the
 	// pipeline still runs Decide() and the rest of pre_tool_use).
 	// Default pre_tool_use entries fire AFTER Decide(), as before.
-	// Only valid on pre_tool_use; ignored on other events.
+	// Only valid on pre_tool_use; rejected on every other event.
 	//
 	// Set it on hooks that implement a security-critical check that
 	// must not be bypassed by auto-approval.
@@ -2902,7 +2929,7 @@ type HookDefinition struct {
 	//   - "builtin":  invoke a named, in-process Go function (the name
 	//                 lives in Command). The set of registered builtins
 	//                 is owned by the runtime; the docker-agent runtime
-	//                 ships add_date, add_environment_info,
+	//                 ships add_context, add_date, add_environment_info,
 	//                 add_prompt_files, redact_secrets (see also the
 	//                 redact_secrets agent flag), and several others
 	//                 documented in pkg/hooks/builtins.
@@ -2919,7 +2946,8 @@ type HookDefinition struct {
 	// Args are arbitrary string arguments passed to the hook handler.
 	// Builtin handlers receive them as the args parameter; future handler
 	// kinds (http, mcp, ...) can adopt the same field. Empty for command
-	// hooks today (the shell command stays self-contained).
+	// hooks today (the shell command stays self-contained). The add_context
+	// builtin renders each argument as a Go template against the hook input.
 	Args []string `json:"args,omitempty" yaml:"args,omitempty"`
 
 	// Timeout is the execution timeout in seconds (default: 60)
@@ -2933,6 +2961,9 @@ type HookDefinition struct {
 
 	// OnError controls non-fail-closed hook failures: warn (default), ignore, or block.
 	OnError string `json:"on_error,omitempty" yaml:"on_error,omitempty"`
+
+	// StrictOutput requires JSON output and validates event-specific capabilities.
+	StrictOutput bool `json:"strict_output,omitempty" yaml:"strict_output,omitempty"`
 
 	// Model is the model spec ("provider/model", e.g. "openai/gpt-4o-mini")
 	// invoked by Type==model hooks. Required for that type, ignored
@@ -2975,195 +3006,16 @@ func (h *HookDefinition) DisplayName() string {
 	return h.Type
 }
 
-// Validate validates the HooksConfig
-func (h *HooksConfig) Validate() error {
-	// Validate PreToolUse matchers
-	for i, m := range h.PreToolUse {
-		if err := m.validate("pre_tool_use", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate PostToolUse matchers
-	for i, m := range h.PostToolUse {
-		if err := m.validate("post_tool_use", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate PermissionRequest matchers
-	for i, m := range h.PermissionRequest {
-		if err := m.validate("permission_request", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate SessionStart hooks
-	for i, hook := range h.SessionStart {
-		if err := hook.validate("session_start", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate UserPromptSubmit hooks
-	for i, hook := range h.UserPromptSubmit {
-		if err := hook.validate("user_prompt_submit", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate UserSteeringMessagesSubmit hooks
-	for i, hook := range h.UserSteeringMessagesSubmit {
-		if err := hook.validate("user_steering_messages_submit", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate UserFollowupSubmit hooks
-	for i, hook := range h.UserFollowupSubmit {
-		if err := hook.validate("user_followup_submit", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate TurnStart hooks
-	for i, hook := range h.TurnStart {
-		if err := hook.validate("turn_start", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate TurnEnd hooks
-	for i, hook := range h.TurnEnd {
-		if err := hook.validate("turn_end", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate BeforeLLMCall hooks
-	for i, hook := range h.BeforeLLMCall {
-		if err := hook.validate("before_llm_call", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate AfterLLMCall hooks
-	for i, hook := range h.AfterLLMCall {
-		if err := hook.validate("after_llm_call", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate SessionEnd hooks
-	for i, hook := range h.SessionEnd {
-		if err := hook.validate("session_end", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate PreCompact hooks
-	for i, hook := range h.PreCompact {
-		if err := hook.validate("pre_compact", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate SubagentStop hooks
-	for i, hook := range h.SubagentStop {
-		if err := hook.validate("subagent_stop", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate OnUserInput hooks
-	for i, hook := range h.OnUserInput {
-		if err := hook.validate("on_user_input", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate Stop hooks
-	for i, hook := range h.Stop {
-		if err := hook.validate("stop", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate Notification hooks
-	for i, hook := range h.Notification {
-		if err := hook.validate("notification", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate OnError hooks
-	for i, hook := range h.OnError {
-		if err := hook.validate("on_error", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate OnMaxIterations hooks
-	for i, hook := range h.OnMaxIterations {
-		if err := hook.validate("on_max_iterations", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate OnAgentSwitch hooks
-	for i, hook := range h.OnAgentSwitch {
-		if err := hook.validate("on_agent_switch", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate OnSessionResume hooks
-	for i, hook := range h.OnSessionResume {
-		if err := hook.validate("on_session_resume", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate OnToolApprovalDecision hooks
-	for i, hook := range h.OnToolApprovalDecision {
-		if err := hook.validate("on_tool_approval_decision", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate BeforeCompaction hooks
-	for i, hook := range h.BeforeCompaction {
-		if err := hook.validate("before_compaction", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate AfterCompaction hooks
-	for i, hook := range h.AfterCompaction {
-		if err := hook.validate("after_compaction", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate ToolResponseTransform matchers
-	for i, m := range h.ToolResponseTransform {
-		if err := m.validate("tool_response_transform", i); err != nil {
-			return err
-		}
-	}
-
-	// Validate WorktreeCreate hooks
-	for i, hook := range h.WorktreeCreate {
-		if err := hook.validate("worktree_create", i); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // validate validates a HookMatcherConfig
 func (m *HookMatcherConfig) validate(eventType string, index int) error {
+	if m.PreemptYolo != nil && eventType != "pre_tool_use" {
+		return fmt.Errorf("hooks.%s[%d]: preempt_yolo is only valid on pre_tool_use", eventType, index)
+	}
+	if m.Matcher != "" && m.Matcher != "*" {
+		if _, err := regexp.Compile("^(?:" + m.Matcher + ")$"); err != nil {
+			return fmt.Errorf("hooks.%s[%d]: invalid matcher: %w", eventType, index, err)
+		}
+	}
 	if len(m.Hooks) == 0 {
 		return fmt.Errorf("hooks.%s[%d]: at least one hook is required", eventType, index)
 	}
@@ -3179,6 +3031,12 @@ func (m *HookMatcherConfig) validate(eventType string, index int) error {
 
 // validate validates a HookDefinition
 func (h *HookDefinition) validate(prefix string, index int) error {
+	if h.OnError != "" && h.OnError != "warn" && h.OnError != "ignore" && h.OnError != "block" {
+		return fmt.Errorf("hooks.%s[%d]: on_error must be warn, ignore, or block", prefix, index)
+	}
+	if h.Timeout < 0 {
+		return fmt.Errorf("hooks.%s[%d]: timeout must not be negative", prefix, index)
+	}
 	if h.Type == "" {
 		return fmt.Errorf("hooks.%s[%d]: type is required", prefix, index)
 	}

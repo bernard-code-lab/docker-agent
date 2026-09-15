@@ -16,6 +16,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/google/uuid"
 
 	"github.com/docker/docker-agent/pkg/app/export"
 	"github.com/docker/docker-agent/pkg/app/transcript"
@@ -161,11 +162,15 @@ func (a *App) Start(ctx context.Context) {
 		// Emit startup info (agent, team, tools) through the events channel.
 		// This runs in the background so the TUI can start immediately while
 		// slow operations (like MCP tool loading) complete asynchronously.
+		// Snapshot the session on this goroutine: ReplaceSession may swap
+		// a.session concurrently, and it re-emits startup info for the new
+		// session itself.
+		sess := a.session
 		go func() {
 			startupEvents := make(chan runtime.Event, 10)
 			go func() {
 				defer close(startupEvents)
-				a.runtime.EmitStartupInfo(ctx, a.session, runtime.NewChannelSink(startupEvents))
+				a.runtime.EmitStartupInfo(ctx, sess, runtime.NewChannelSink(startupEvents))
 			}()
 			for event := range startupEvents {
 				select {
@@ -415,6 +420,9 @@ func (a *App) SkillCommandFork(_ context.Context, input string) (skillName, task
 // SKILL.md body. Companion of SkillCommandFork.
 func (a *App) RunSkillFork(ctx context.Context, cancel context.CancelFunc, skillName, task string, _ []messages.Attachment) {
 	a.cancel = cancel
+	// Snapshot the session like Run does: the goroutines below outlive any
+	// concurrent ReplaceSession and must keep working against this session.
+	sess := a.session
 
 	// Mirrors App.Run's drain loop: forward events to the App bus and
 	// always let StreamStoppedEvent through, even after ctx cancellation,
@@ -424,7 +432,7 @@ func (a *App) RunSkillFork(ctx context.Context, cancel context.CancelFunc, skill
 		var failed atomic.Bool
 		go func() {
 			defer close(events)
-			result, err := a.runtime.RunSkillFork(ctx, a.session, skillstool.RunSkillArgs{
+			result, err := a.runtime.RunSkillFork(ctx, sess, skillstool.RunSkillArgs{
 				Name: skillName,
 				Task: task,
 			}, runtime.NewChannelSink(events))
@@ -478,7 +486,7 @@ func (a *App) RunSkillFork(ctx context.Context, cancel context.CancelFunc, skill
 		}
 
 		if !sawStop {
-			a.synthesizeStreamStopped(ctx, cmp.Or(lastSessionID, a.session.ID), agentName, failed.Load())
+			a.synthesizeStreamStopped(ctx, cmp.Or(lastSessionID, sess.ID), agentName, failed.Load())
 		}
 	}()
 }
@@ -554,24 +562,28 @@ func (a *App) EmitStartupInfo(ctx context.Context, events chan runtime.Event) {
 // Run one agent loop
 func (a *App) Run(ctx context.Context, cancel context.CancelFunc, message string, attachments []messages.Attachment) {
 	a.cancel = cancel
+	sess := a.session
 
 	// If this is the first message and no title exists, start local title generation
-	if a.session.TitleSnapshot() == "" && a.titleGen != nil {
+	if sess.TitleSnapshot() == "" && a.titleGen != nil {
 		a.titleGenerating.Store(true)
-		go a.generateTitle(ctx, []string{message})
+		go a.generateTitle(ctx, sess, []string{message})
 	}
 
 	go func() {
 		release := a.acquireStreamGuard()
 		defer release()
+		if ctx.Err() != nil {
+			return
+		}
 
 		if len(attachments) > 0 {
-			multiContent := a.buildUserMultiContent(ctx, message, attachments)
-			a.session.AddMessage(session.UserMessage(message, multiContent...))
+			multiContent := a.buildUserMultiContent(ctx, sess, message, attachments)
+			sess.AddMessage(session.UserMessage(message, multiContent...))
 		} else {
-			a.session.AddMessage(session.UserMessage(message))
+			sess.AddMessage(session.UserMessage(message))
 		}
-		a.forwardRunStreamEvents(ctx, a.runtime.RunStream(ctx, a.session), nil)
+		a.forwardRunStreamEvents(ctx, sess, a.runtime.RunStream(ctx, sess), nil)
 	}()
 }
 
@@ -580,7 +592,7 @@ func (a *App) Run(ctx context.Context, cancel context.CancelFunc, message string
 // and inlined text files — keeping everything in one text block ensures the
 // model sees file content together with the message, rather than as separate
 // content blocks — followed by any binary parts (images, PDFs, …).
-func (a *App) buildUserMultiContent(ctx context.Context, message string, attachments []messages.Attachment) []chat.MessagePart {
+func (a *App) buildUserMultiContent(ctx context.Context, sess *session.Session, message string, attachments []messages.Attachment) []chat.MessagePart {
 	var textBuilder strings.Builder
 	textBuilder.WriteString(message)
 
@@ -596,7 +608,7 @@ func (a *App) buildUserMultiContent(ctx context.Context, message string, attachm
 			// dangling references to directories or missing paths. The editor
 			// resolves @-mentions to absolute paths before this point.
 			if a.processFileAttachment(ctx, att, &textBuilder, &binaryParts) {
-				a.session.AddAttachedFile(att.FilePath)
+				sess.AddAttachedFile(att.FilePath)
 			}
 		case att.Content != "":
 			// Inline content attachment (e.g. pasted text).
@@ -786,7 +798,7 @@ func mustSkipMirroredElicitation(rt runtime.Runtime) bool {
 // may itself veto forwarding an event by returning false. Retry uses it to
 // suppress the pre-StreamStarted re-emitted user message; Run and
 // RunWithMessage pass nil.
-func (a *App) forwardRunStreamEvents(ctx context.Context, ch <-chan runtime.Event, filter func(event runtime.Event) (forward bool)) {
+func (a *App) forwardRunStreamEvents(ctx context.Context, sess *session.Session, ch <-chan runtime.Event, filter func(event runtime.Event) (forward bool)) {
 	skipMirroredElicitation := mustSkipMirroredElicitation(a.runtime)
 
 	// sawRootStop/sawRootError/agentName drive the #4136 fallback below: the
@@ -801,7 +813,7 @@ func (a *App) forwardRunStreamEvents(ctx context.Context, ch <-chan runtime.Even
 	)
 
 	for event := range ch {
-		isRoot := isRootSessionEvent(event, a.session.ID)
+		isRoot := isRootSessionEvent(event, sess.ID)
 		if isRoot {
 			if name := event.GetAgentName(); name != "" {
 				agentName = name
@@ -852,7 +864,7 @@ func (a *App) forwardRunStreamEvents(ctx context.Context, ch <-chan runtime.Even
 	}
 
 	if !sawRootStop {
-		a.synthesizeStreamStopped(ctx, a.session.ID, agentName, sawRootError)
+		a.synthesizeStreamStopped(ctx, sess.ID, agentName, sawRootError)
 	}
 }
 
@@ -935,13 +947,17 @@ func (a *App) processInlineAttachment(att messages.Attachment, textBuilder *stri
 // arrive after StreamStarted and are forwarded normally.
 func (a *App) Retry(ctx context.Context, cancel context.CancelFunc) {
 	a.cancel = cancel
+	sess := a.session
 
 	go func() {
 		release := a.acquireStreamGuard()
 		defer release()
+		if ctx.Err() != nil {
+			return
+		}
 
 		streamStarted := false
-		a.forwardRunStreamEvents(ctx, a.runtime.RunStream(ctx, a.session), func(event runtime.Event) bool {
+		a.forwardRunStreamEvents(ctx, sess, a.runtime.RunStream(ctx, sess), func(event runtime.Event) bool {
 			switch event.(type) {
 			case *runtime.StreamStartedEvent:
 				streamStarted = true
@@ -959,9 +975,10 @@ func (a *App) Retry(ctx context.Context, cancel context.CancelFunc) {
 // This is used for special cases like image attachments.
 func (a *App) RunWithMessage(ctx context.Context, cancel context.CancelFunc, msg *session.Message) {
 	a.cancel = cancel
+	sess := a.session
 
 	// If this is the first message and no title exists, start local title generation
-	if a.session.TitleSnapshot() == "" && a.titleGen != nil {
+	if sess.TitleSnapshot() == "" && a.titleGen != nil {
 		a.titleGenerating.Store(true)
 		// Extract text content from the message for title generation
 		userMessage := msg.Message.Content
@@ -973,15 +990,18 @@ func (a *App) RunWithMessage(ctx context.Context, cancel context.CancelFunc, msg
 				}
 			}
 		}
-		go a.generateTitle(ctx, []string{userMessage})
+		go a.generateTitle(ctx, sess, []string{userMessage})
 	}
 
 	go func() {
 		release := a.acquireStreamGuard()
 		defer release()
+		if ctx.Err() != nil {
+			return
+		}
 
-		a.session.AddMessage(msg)
-		a.forwardRunStreamEvents(ctx, a.runtime.RunStream(ctx, a.session), nil)
+		sess.AddMessage(msg)
+		a.forwardRunStreamEvents(ctx, sess, a.runtime.RunStream(ctx, sess), nil)
 	}()
 }
 
@@ -1129,26 +1149,71 @@ func (a *App) FollowUp(ctx context.Context, msg runtime.QueuedMessage) error {
 	return a.runtime.FollowUp(ctx, msg)
 }
 
-// SteerMessage resolves attachments into message parts and queues the result
-// for mid-turn injection into the running agent. The runtime appends the
-// message to the session (and emits the matching UserMessageEvent) when the
-// agent loop drains it.
-func (a *App) SteerMessage(ctx context.Context, content string, attachments []messages.Attachment) error {
-	msg := runtime.QueuedMessage{Content: content}
-	if len(attachments) > 0 {
-		msg.MultiContent = a.buildUserMultiContent(ctx, content, attachments)
+// CancelPendingMessage withdraws a queued steer or follow-up before the runtime
+// consumes it. Runtimes without queue cancellation support return false.
+func (a *App) CancelPendingMessage(ctx context.Context, msg runtime.QueuedMessage, followUp bool) bool {
+	canceler, ok := a.runtime.(runtime.PendingMessageCanceler)
+	if !ok {
+		return false
 	}
-	return a.runtime.Steer(ctx, msg)
+	if followUp {
+		return canceler.CancelFollowUp(ctx, msg.ID)
+	}
+	return canceler.CancelSteer(ctx, msg.ID)
+}
+
+// SteerMessage resolves attachments into message parts and queues the result
+// for mid-turn injection into the running agent.
+func (a *App) SteerMessage(ctx context.Context, content string, attachments []messages.Attachment) error {
+	_, err := a.QueueSteerMessage(ctx, content, attachments)
+	return err
+}
+
+// QueueSteerMessage is SteerMessage with the queue entry returned for cancellation.
+func (a *App) QueueSteerMessage(ctx context.Context, content string, attachments []messages.Attachment) (runtime.QueuedMessage, error) {
+	return a.QueueSteerMessageForSession(ctx, a.session, content, attachments)
+}
+
+// QueueSteerMessageForSession uses the caller's session snapshot during asynchronous attachment resolution.
+func (a *App) QueueSteerMessageForSession(ctx context.Context, sess *session.Session, content string, attachments []messages.Attachment) (runtime.QueuedMessage, error) {
+	msg := runtime.QueuedMessage{ID: uuid.NewString(), Content: content}
+	if err := ctx.Err(); err != nil {
+		return msg, err
+	}
+	if len(attachments) > 0 {
+		msg.MultiContent = a.buildUserMultiContent(ctx, sess, content, attachments)
+	}
+	if err := ctx.Err(); err != nil {
+		return msg, err
+	}
+	return msg, a.runtime.Steer(ctx, msg)
 }
 
 // FollowUpMessage resolves attachments and queues a message for a separate turn
 // after the current agent turn finishes.
 func (a *App) FollowUpMessage(ctx context.Context, content string, attachments []messages.Attachment) error {
-	msg := runtime.QueuedMessage{Content: content}
-	if len(attachments) > 0 {
-		msg.MultiContent = a.buildUserMultiContent(ctx, content, attachments)
+	_, err := a.QueueFollowUpMessage(ctx, content, attachments)
+	return err
+}
+
+// QueueFollowUpMessage is FollowUpMessage with the queue entry returned for cancellation.
+func (a *App) QueueFollowUpMessage(ctx context.Context, content string, attachments []messages.Attachment) (runtime.QueuedMessage, error) {
+	return a.QueueFollowUpMessageForSession(ctx, a.session, content, attachments)
+}
+
+// QueueFollowUpMessageForSession uses the caller's session snapshot during asynchronous attachment resolution.
+func (a *App) QueueFollowUpMessageForSession(ctx context.Context, sess *session.Session, content string, attachments []messages.Attachment) (runtime.QueuedMessage, error) {
+	msg := runtime.QueuedMessage{ID: uuid.NewString(), Content: content}
+	if err := ctx.Err(); err != nil {
+		return msg, err
 	}
-	return a.runtime.FollowUp(ctx, msg)
+	if len(attachments) > 0 {
+		msg.MultiContent = a.buildUserMultiContent(ctx, sess, content, attachments)
+	}
+	if err := ctx.Err(); err != nil {
+		return msg, err
+	}
+	return msg, a.runtime.FollowUp(ctx, msg)
 }
 
 // TogglePause toggles whether the runtime loop is paused at iteration
@@ -1217,8 +1282,11 @@ func (a *App) NewSession() {
 // through the events channel so the sidebar updates.
 func (a *App) reEmitStartupInfo(ctx context.Context) {
 	a.runtime.ResetStartupInfo()
+	// Snapshot before handing off to the background goroutine so a later
+	// ReplaceSession cannot race with this read.
+	sess := a.session
 	a.pumpToEvents(ctx, func(sink runtime.EventSink) {
-		a.runtime.EmitStartupInfo(ctx, a.session, sink)
+		a.runtime.EmitStartupInfo(ctx, sess, sink)
 	})
 }
 
@@ -1253,6 +1321,36 @@ func (a *App) Session() *session.Session {
 // don't, so the /context dialog reports the feature as unavailable.
 type contextBreakdownProvider interface {
 	ContextBreakdown(ctx context.Context, sess *session.Session) (*runtime.ContextBreakdown, error)
+}
+
+// generatedFileResolver is an optional runtime capability: resolving one
+// recorded generated-media reference to its bytes and validated canonical
+// path, gated on the generated-media manifest and the owning session's
+// workspace (see [runtime.LocalRuntime.ResolveGeneratedFile]). Only the
+// local runtime implements it; remote runtimes never deliver generated-file
+// payloads, so UIs treat the missing capability as "nothing to resolve".
+type generatedFileResolver interface {
+	ResolveGeneratedFile(ctx context.Context, ref runtime.GeneratedFileRef) (*runtime.ResolvedGeneratedFile, error)
+}
+
+// CanResolveGeneratedFiles reports whether the runtime can resolve
+// generated-media references at all, letting UIs skip resolution work
+// entirely on runtimes without the capability.
+func (a *App) CanResolveGeneratedFiles() bool {
+	_, ok := a.runtime.(generatedFileResolver)
+	return ok
+}
+
+// ResolveGeneratedFile resolves one recorded generated-media reference.
+// Returns an error wrapping [runtime.ErrUnsupported] when the runtime does
+// not own local generated media (e.g. remote runtimes). Callers must treat
+// any error as "unavailable" — never surface its text to the user.
+func (a *App) ResolveGeneratedFile(ctx context.Context, ref runtime.GeneratedFileRef) (*runtime.ResolvedGeneratedFile, error) {
+	resolver, ok := a.runtime.(generatedFileResolver)
+	if !ok {
+		return nil, fmt.Errorf("generated file resolution: %w", runtime.ErrUnsupported)
+	}
+	return resolver.ResolveGeneratedFile(ctx, ref)
 }
 
 // ContextBreakdown returns the estimated context-window composition for the
@@ -1985,7 +2083,7 @@ func (a *App) IsTitleGenerating() bool {
 // generateTitle generates a title using the local title generator.
 // This method always clears the titleGenerating flag when done (success or failure).
 // It should be called in a goroutine.
-func (a *App) generateTitle(ctx context.Context, userMessages []string) {
+func (a *App) generateTitle(ctx context.Context, sess *session.Session, userMessages []string) {
 	// Always clear the flag when done, whether success or failure
 	defer a.titleGenerating.Store(false)
 
@@ -1993,18 +2091,18 @@ func (a *App) generateTitle(ctx context.Context, userMessages []string) {
 		slog.DebugContext(ctx, "No title generator available, skipping title generation")
 		// Emit empty title event so the UI clears any title-generation spinner
 		select {
-		case a.events <- runtime.SessionTitle(a.session.ID, ""):
+		case a.events <- runtime.SessionTitle(sess.ID, ""):
 		case <-ctx.Done():
 		}
 		return
 	}
 
-	title, err := a.titleGen.Generate(ctx, a.session.ID, userMessages)
+	title, err := a.titleGen.Generate(ctx, sess.ID, userMessages)
 	if err != nil {
-		slog.ErrorContext(ctx, "Failed to generate session title", "session_id", a.session.ID, "error", err)
+		slog.ErrorContext(ctx, "Failed to generate session title", "session_id", sess.ID, "error", err)
 		// Emit empty title event so the UI clears any title-generation spinner
 		select {
-		case a.events <- runtime.SessionTitle(a.session.ID, ""):
+		case a.events <- runtime.SessionTitle(sess.ID, ""):
 		case <-ctx.Done():
 		}
 		return
@@ -2013,20 +2111,20 @@ func (a *App) generateTitle(ctx context.Context, userMessages []string) {
 	if title == "" {
 		// Emit empty title event so the UI clears any title-generation spinner
 		select {
-		case a.events <- runtime.SessionTitle(a.session.ID, ""):
+		case a.events <- runtime.SessionTitle(sess.ID, ""):
 		case <-ctx.Done():
 		}
 		return
 	}
 
 	// Persist the title
-	if err := a.runtime.UpdateSessionTitle(ctx, a.session, title); err != nil {
-		slog.ErrorContext(ctx, "Failed to persist title", "session_id", a.session.ID, "error", err)
+	if err := a.runtime.UpdateSessionTitle(ctx, sess, title); err != nil {
+		slog.ErrorContext(ctx, "Failed to persist title", "session_id", sess.ID, "error", err)
 	}
 
 	// Emit the title event to update the UI
 	select {
-	case a.events <- runtime.SessionTitle(a.session.ID, title):
+	case a.events <- runtime.SessionTitle(sess.ID, title):
 	case <-ctx.Done():
 	}
 }
@@ -2055,7 +2153,7 @@ func (a *App) RegenerateSessionTitle(ctx context.Context) error {
 			}
 		}
 
-		go a.generateTitle(ctx, userMessages)
+		go a.generateTitle(ctx, a.session, userMessages)
 		return nil
 	}
 
