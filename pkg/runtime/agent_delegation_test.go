@@ -1841,16 +1841,16 @@ func delegatingAgent(name string, subAgents []*agent.Agent, targets ...string) *
 
 // handoffProbe returns an agent whose model invocations are counted, standing
 // in for a force_handoff target that must (or must not) be reached.
-func handoffProbe(name string) (*agent.Agent, *handoffRecordingProvider) {
+func handoffProbe() (*agent.Agent, *handoffRecordingProvider) {
 	prov := &handoffRecordingProvider{
 		mockProvider: mockProvider{id: "test/mock-model"},
 		// Fresh per invocation: a batch of parallel delegations all routing here
 		// reaches the probe concurrently.
 		newStream: func() chat.MessageStream {
-			return newStreamBuilder().AddContent(name+" done").AddStopWithUsage(10, 5).Build()
+			return newStreamBuilder().AddContent("finisher done").AddStopWithUsage(10, 5).Build()
 		},
 	}
-	return agent.New(name, name+" agent", agent.WithModel(prov)), prov
+	return agent.New("finisher", "finisher agent", agent.WithModel(prov)), prov
 }
 
 // newDelegationRuntime wires a team into a runtime with the usual test doubles.
@@ -1887,7 +1887,7 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 			name: "solo delegation switches and honours the child's force_handoff",
 			setup: func(t *testing.T) (*LocalRuntime, *handoffRecordingProvider) {
 				t.Helper()
-				finisher, probe := handoffProbe("finisher")
+				finisher, probe := handoffProbe()
 				worker := agent.New("worker", "worker agent",
 					agent.WithModel(&mockProvider{
 						id:     "test/mock-model",
@@ -1904,7 +1904,7 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 			name: "sequential nested delegation switches and honours force_handoff",
 			setup: func(t *testing.T) (*LocalRuntime, *handoffRecordingProvider) {
 				t.Helper()
-				finisher, probe := handoffProbe("finisher")
+				finisher, probe := handoffProbe()
 				worker := agent.New("worker", "worker agent",
 					agent.WithModel(&mockProvider{
 						id:     "test/mock-model",
@@ -1922,7 +1922,7 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 			name: "batch mixing another tool leaves the delegation solo",
 			setup: func(t *testing.T) (*LocalRuntime, *handoffRecordingProvider) {
 				t.Helper()
-				finisher, probe := handoffProbe("finisher")
+				finisher, probe := handoffProbe()
 				worker := agent.New("worker", "worker agent",
 					agent.WithModel(&mockProvider{
 						id:     "test/mock-model",
@@ -1957,7 +1957,7 @@ func TestTransferTask_PinningByBatchShape(t *testing.T) {
 			name: "parallel sibling batch pins every child, force_handoff still reached",
 			setup: func(t *testing.T) (*LocalRuntime, *handoffRecordingProvider) {
 				t.Helper()
-				finisher, probe := handoffProbe("finisher")
+				finisher, probe := handoffProbe()
 				workers := make([]*agent.Agent, 0, 3)
 				for _, name := range []string{"drafter", "reviewer", "tester"} {
 					workers = append(workers, agent.New(name, name+" agent",

@@ -129,9 +129,11 @@ func (r *LocalRuntime) runSkillFork(ctx context.Context, sess *session.Session, 
 	// Skills are sub-sessions of the caller, not delegations, so the
 	// runtime's currentAgent stays put and the delegation lineage is
 	// inherited unchanged (no DelegationLineage: not a delegation edge).
-	// When the caller session is itself pinned (a background agent's
-	// session), pin the child to the same agent so RunStream resolves it
-	// as the pinned caller instead of the shared current agent.
+	// The child is always pinned to the caller: the caller is already
+	// resolved here, so RunStream never has to consult the shared current
+	// agent — which a pinned parent must not expose (#3886) and which a
+	// sibling transfer_task in the same batch may have swapped to its own
+	// target (#4156).
 	return r.runForwarding(ctx, sess, evts, delegationRequest{
 		CallerAgent: caller,
 		SubSessionConfig: SubSessionConfig{
@@ -144,7 +146,7 @@ func (r *LocalRuntime) runSkillFork(ctx context.Context, sess *session.Session, 
 			SafetyPolicy:        sess.GetSafetyPolicy(),
 			Permissions:         sess.ClonePermissions(),
 			NonInteractive:      sess.NonInteractive,
-			PinAgent:            sess.AgentName != "",
+			PinAgent:            true,
 			ExcludedTools:       []string{skills.ToolNameRunSkill},
 			AllowedTools:        prepared.AllowedTools,
 			ExtraToolSets:       prepared.ToolSets,
